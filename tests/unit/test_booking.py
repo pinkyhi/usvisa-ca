@@ -368,6 +368,8 @@ class RunnerTests(NoNetworkTest):
         client = context.__enter__.return_value
         client.prepare_session.side_effect = [RateLimited(), None]
         with patch.object(reschedule, "RUN_ONCE", False), \
+             patch.multiple(reschedule, RATE_LIMIT_BACKOFF_INITIAL_DELAY=4,
+                            RATE_LIMIT_BACKOFF_MAX_DELAY=4096, RATE_LIMIT_BACKOFF_MULTIPLIER=2), \
              patch.object(reschedule, "get_chrome_driver", return_value=driver) as browser, \
              patch.object(reschedule, "login") as login, \
              patch.object(reschedule.AppointmentClient, "from_driver", return_value=context), \

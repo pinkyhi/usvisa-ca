@@ -1,4 +1,6 @@
 from datetime import date, datetime
+import json
+from pathlib import Path
 from time import sleep
 
 from selenium import webdriver
@@ -17,9 +19,25 @@ from session_cache import SessionCache
 from settings import *
 
 
+AVAILABLE_DATES_LOG_PATH = Path(__file__).resolve().parent / "logs" / "available_dates.log"
+
+
 def log_message(message: str) -> None:
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] {message}")
+
+
+def log_available_dates(dates):
+    if not dates:
+        return
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    message = f"[{timestamp}] Consulate: {USER_CONSULATE}; available dates: {json.dumps([day.isoformat() for day in dates])}"
+    try:
+        AVAILABLE_DATES_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with AVAILABLE_DATES_LOG_PATH.open("a", encoding="utf-8") as output:
+            output.write(message + "\n")
+    except OSError as error:
+        log_message(f"Could not write available dates log ({type(error).__name__})")
 
 def get_chrome_driver() -> WebDriver:
     options = webdriver.ChromeOptions()
@@ -70,12 +88,14 @@ def login(driver: WebDriver) -> None:
 
 def get_available_dates(client: AppointmentClient):
     try:
-        return client.get_available_dates()
+        dates = client.get_available_dates()
     except (AuthenticationExpired, RateLimited):
         raise
     except PortalError as error:
         log_message(str(error))
         return None
+    log_available_dates(dates)
+    return dates
 
 
 class RateLimitExhausted(PortalError):
@@ -258,6 +278,7 @@ def reschedule_with_new_session(backoff=None):
     if cache is not None:
         client = cache.load(CONSULATES[USER_CONSULATE], USER_CONSULATE, HTTP_TIMEOUT)
         if client is not None:
+            log_message("Saved login session loaded; checking it through HTTP before deciding whether Selenium login is needed")
             try:
                 with client:
                     return run_http_session(client, cache, validate_session=True, backoff=backoff)

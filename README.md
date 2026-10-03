@@ -114,6 +114,12 @@ one availability check, with no delay or retry, including on HTTP 429. A suitabl
 date can trigger further requests for times, the booking form and verification.
 Restart the script after changing `.env`.
 
+Every nonempty availability response is appended to `logs/available_dates.log`
+with the local timestamp, consulate and full list of dates, before filtering by
+the configured range or exclusions. Empty responses are not written to this file.
+The log is preserved across restarts; a write failure is reported in the console
+and does not interrupt polling.
+
 HTTP 429 responses trigger cooldowns of 4, 8, 16, 32, 64, 128, 256, 512, 1024,
 2048 and 4096 seconds. A further 429 sends a Gmail notification and stops the
 program with exit code 1. `Retry-After` seconds or HTTP dates can extend a cooldown.

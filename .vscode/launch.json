@@ -12,7 +12,6 @@
       "justMyCode": true,
       "env": {
         "TEST_MODE": "true",
-        "RUN_ONCE": "true",
         "NEW_SESSION_AFTER_FAILURES": "1"
       }
     },
