@@ -269,6 +269,7 @@ class RunnerTests(NoNetworkTest):
             "DATE_REQUEST_DELAY": 0, "DATE_REQUEST_MAX_TIME": 900,
             "DATE_REQUEST_MAX_RETRY": 1, "RUN_ONCE": True, "FAIL_RETRY_DELAY": 0,
             "NEW_SESSION_AFTER_FAILURES": 1,
+            "PERSIST_SESSION": False,
         }
         patcher = patch.multiple(reschedule, **configuration)
         patcher.start()

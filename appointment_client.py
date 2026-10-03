@@ -221,6 +221,10 @@ class AppointmentClient:
                 raise PortalError("This account requires an ASC appointment; complete its setup first")
         return fields, csrf
 
+    def check_session(self):
+        """Validate a restored login with a read-only request for its booking form."""
+        self._booking_form()
+
     def _saved_appointment_matches(self, html, day, slot_time, account_page=False):
         soup = BeautifulSoup(html, "html.parser")
         # Form values/scripts can echo a rejected submission, so ignore them.

@@ -15,6 +15,7 @@ from appointment_client import (
 )
 from notifications import send_notification
 from request_tracker import RequestTracker
+from session_cache import SessionCache
 from settings import *
 
 
@@ -236,7 +237,34 @@ def close_driver(driver):
         log_message(f"Browser cleanup failed ({type(error).__name__})")
 
 
+def run_http_session(client, retryCount, cache=None, validate_session=False):
+    session_valid = True
+    try:
+        if validate_session:
+            client.check_session()
+            log_message("Saved login session is valid; Selenium login was skipped")
+        return reschedule(client, retryCount)
+    except AuthenticationExpired:
+        session_valid = False
+        if cache is not None:
+            cache.invalidate()
+        raise
+    finally:
+        if cache is not None and session_valid:
+            # Save the latest HTTP cookies, not just those originally from Chrome.
+            cache.save(client)
+
+
 def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY):
+    cache = SessionCache(SESSION_CACHE_DIR, USER_EMAIL) if PERSIST_SESSION else None
+    if cache is not None:
+        client = cache.load(CONSULATES[USER_CONSULATE], USER_CONSULATE, HTTP_TIMEOUT)
+        if client is not None:
+            try:
+                with client:
+                    return run_http_session(client, retryCount, cache, validate_session=True)
+            except AuthenticationExpired:
+                log_message("Saved login session expired; logging in again with Selenium")
     driver = get_chrome_driver()
     try:
         for attempt in range(NEW_SESSION_AFTER_FAILURES):
@@ -258,7 +286,7 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY):
             close_driver(driver)
             driver = None
             log_message("Selenium login completed; availability and booking now use requests")
-            return reschedule(client, retryCount)
+            return run_http_session(client, retryCount, cache)
     finally:
         if driver is not None:
             close_driver(driver)
