@@ -1,11 +1,10 @@
-import re
 from datetime import date, datetime
 from time import sleep
 
 from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.common.exceptions import WebDriverException
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -63,100 +62,10 @@ def login(driver: WebDriver) -> None:
         EC.invisibility_of_element_located((By.ID, "user_email")),
         message="Login did not complete; check the visa account credentials",
     )
-
-
-def _find_visible_action(driver: WebDriver, label: str):
-    locators = (
-        (By.LINK_TEXT, label),
-        (By.XPATH, f"//button[normalize-space()='{label}']"),
-        (By.XPATH, f"//input[@value='{label}']"),
-    )
-    for locator in locators:
-        for element in driver.find_elements(*locator):
-            if element.is_displayed() and element.is_enabled():
-                return element
-    return False
-
-
-def _click_action_if_present(
-    driver: WebDriver, label: str, timeout: float
-) -> bool:
-    try:
-        action = WebDriverWait(driver, timeout).until(
-            lambda current_driver: _find_visible_action(current_driver, label)
-        )
-    except TimeoutException:
-        return False
-    action.click()
-    sleep(2)
-    return True
-
-
-def _has_visible_element(driver: WebDriver, locator) -> bool:
-    return any(
-        element.is_displayed()
-        for element in driver.find_elements(*locator)
-    )
-
-
-def _appointment_page_state(driver: WebDriver):
-    if _has_visible_element(
-        driver, (By.ID, "appointments_consulate_appointment_date_input")
-    ):
-        return "ready"
-    if _find_visible_action(driver, "Schedule Appointment"):
-        return "schedule"
-    if _has_visible_element(driver, (By.CLASS_NAME, "icheckbox")):
-        return "policy"
-    if _find_visible_action(driver, "Continue"):
-        return "continue"
-    return False
-
-
-def _prepare_appointment_page(driver: WebDriver) -> None:
-    timeout = TIMEOUT
-    for _ in range(5):
-        state = WebDriverWait(driver, timeout).until(_appointment_page_state)
-        if state == "ready":
-            return
-        if state in {"schedule", "continue"}:
-            label = "Schedule Appointment" if state == "schedule" else "Continue"
-            _click_action_if_present(driver, label, timeout)
-            continue
-
-        policy_checkbox = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.CLASS_NAME, "icheckbox"))
-        )
-        policy_checkbox.click()
-        continue_button = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.NAME, "commit"))
-        )
-        continue_button.click()
-
     WebDriverWait(driver, timeout).until(
-        lambda current_driver: _appointment_page_state(current_driver) == "ready"
+        lambda current: "/users/sign_in" not in current.current_url,
+        message="Login did not redirect to the account page",
     )
-
-
-def get_appointment_page(driver: WebDriver) -> None:
-    timeout = TIMEOUT
-
-    # Newer flows show a group-action page with this link. Older flows first
-    # show a Continue link and then expose Schedule Appointment.
-    if not _click_action_if_present(driver, "Schedule Appointment", 2):
-        if not _click_action_if_present(driver, "Continue", timeout):
-            raise TimeoutException(
-                "Could not find either 'Schedule Appointment' or 'Continue'"
-            )
-        _click_action_if_present(driver, "Schedule Appointment", timeout)
-
-    current_url = driver.current_url
-    schedule_match = re.search(r"/schedule/(\d+)", current_url)
-    if not schedule_match:
-        raise PortalError("Could not find the schedule id after opening the appointment page")
-
-    appointment_url = APPOINTMENT_PAGE_URL.format(id=schedule_match.group(1))
-    driver.get(appointment_url)
 
 
 def get_available_dates(client: AppointmentClient):
@@ -312,13 +221,11 @@ def reschedule_with_new_session(backoff=None):
         for attempt in range(NEW_SESSION_AFTER_FAILURES):
             try:
                 login(driver)
-                get_appointment_page(driver)
-                _prepare_appointment_page(driver)
                 break
             except WebDriverException as error:
-                log_message(f"Could not prepare appointment page ({type(error).__name__})")
+                log_message(f"Could not sign in ({type(error).__name__})")
                 if attempt + 1 == NEW_SESSION_AFTER_FAILURES:
-                    raise PortalError("Selenium could not prepare the appointment page after all login attempts") from error
+                    raise PortalError("Selenium could not sign in after all login attempts") from error
                 sleep(FAIL_RETRY_DELAY)
         with AppointmentClient.from_driver(
             driver, CONSULATES[USER_CONSULATE], USER_CONSULATE, HTTP_TIMEOUT,
@@ -327,7 +234,16 @@ def reschedule_with_new_session(backoff=None):
             # background requests while polling/bookings proceed over HTTP.
             close_driver(driver)
             driver = None
-            log_message("Selenium login completed; availability and booking now use requests")
+            log_message("Selenium sign-in completed; preparing appointment through requests")
+            setup_backoff = backoff if backoff is not None else RateLimitBackoff()
+            while True:
+                try:
+                    client.prepare_session()
+                    break
+                except RateLimited as error:
+                    if RUN_ONCE:
+                        raise
+                    setup_backoff.wait(error)
             return run_http_session(client, cache, backoff=backoff)
     finally:
         if driver is not None:

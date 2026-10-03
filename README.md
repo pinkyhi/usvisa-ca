@@ -81,7 +81,9 @@ You can add upto 9 exclusion date ranges. Each date range to be excluded using t
 python reschedule.py
 ```
 
-Selenium handles login; `requests` checks availability, submits the booking and verifies
+Selenium only signs in and hands off cookies; Chrome then closes. `requests`
+discovers the application, follows setup links and completes consent screens,
+checks availability, submits the booking and verifies
 the saved date, time and consulate. `TEST_MODE=true` (default) prepares the form
 without submitting it; set `TEST_MODE=false` in `.env` for real booking.
 An unverified booking stops the script for manual checking.

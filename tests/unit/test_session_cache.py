@@ -167,8 +167,6 @@ class SessionReuseTests(NoNetworkTest):
         with patch.object(reschedule, "SessionCache", return_value=self.cache), \
              patch.object(reschedule, "get_chrome_driver", return_value=driver) as browser, \
              patch.object(reschedule, "login") as login, \
-             patch.object(reschedule, "get_appointment_page"), \
-             patch.object(reschedule, "_prepare_appointment_page"), \
              patch.object(reschedule.AppointmentClient, "from_driver", return_value=context), \
              patch.object(reschedule, "reschedule", return_value=self.result):
             self.assertEqual(reschedule.reschedule_with_new_session(), self.result)
@@ -194,8 +192,6 @@ class SessionReuseTests(NoNetworkTest):
         with patch.object(reschedule, "SessionCache", return_value=self.cache), \
              patch.object(reschedule, "get_chrome_driver", return_value=driver), \
              patch.object(reschedule, "login") as login, \
-             patch.object(reschedule, "get_appointment_page"), \
-             patch.object(reschedule, "_prepare_appointment_page"), \
              patch.object(reschedule.AppointmentClient, "from_driver", return_value=context), \
              patch.object(reschedule, "reschedule",
                           side_effect=[AuthenticationExpired("expired"), self.result]):
@@ -230,8 +226,7 @@ class SessionReuseTests(NoNetworkTest):
         with patch.object(reschedule, "PERSIST_SESSION", False), \
              patch.object(reschedule, "SessionCache") as cache_class, \
              patch.object(reschedule, "get_chrome_driver", return_value=driver), \
-             patch.object(reschedule, "login"), patch.object(reschedule, "get_appointment_page"), \
-             patch.object(reschedule, "_prepare_appointment_page"), \
+             patch.object(reschedule, "login"), \
              patch.object(reschedule.AppointmentClient, "from_driver", return_value=context), \
              patch.object(reschedule, "reschedule", return_value=self.result):
             self.assertEqual(reschedule.reschedule_with_new_session(), self.result)

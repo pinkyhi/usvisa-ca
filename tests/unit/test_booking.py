@@ -16,7 +16,7 @@ import reschedule
 import settings
 from appointment_client import (
     AppointmentClient, AuthenticationExpired, BookingNotVerified, BookingResult,
-    PortalError, acceptable_dates, appointment_matches, form_fields,
+    PortalError, RateLimited, acceptable_dates, appointment_matches, form_fields,
 )
 from request_tracker import RequestTracker
 
@@ -327,12 +327,14 @@ class RunnerTests(NoNetworkTest):
 
         def poll(current_client):
             driver.quit.assert_called_once()
+            client.prepare_session.assert_called_once()
             self.assertIs(current_client, client)
             return result
 
+        client.prepare_session.side_effect = lambda: driver.quit.assert_called_once()
+
         with patch.object(reschedule, "get_chrome_driver", return_value=driver), \
-             patch.object(reschedule, "login"), patch.object(reschedule, "get_appointment_page"), \
-             patch.object(reschedule, "_prepare_appointment_page"), \
+             patch.object(reschedule, "login"), \
              patch.object(reschedule.AppointmentClient, "from_driver", return_value=context), \
              patch.object(reschedule, "reschedule", side_effect=poll):
             self.assertEqual(reschedule.reschedule_with_new_session(), result)
@@ -345,6 +347,24 @@ class RunnerTests(NoNetworkTest):
             with self.assertRaises(PortalError):
                 reschedule.reschedule_with_new_session()
         driver.quit.assert_called_once()
+
+    def test_setup_rate_limit_retries_http_without_another_browser_login(self):
+        driver = Mock()
+        context = MagicMock()
+        client = context.__enter__.return_value
+        client.prepare_session.side_effect = [RateLimited(), None]
+        with patch.object(reschedule, "RUN_ONCE", False), \
+             patch.object(reschedule, "get_chrome_driver", return_value=driver) as browser, \
+             patch.object(reschedule, "login") as login, \
+             patch.object(reschedule.AppointmentClient, "from_driver", return_value=context), \
+             patch.object(reschedule, "reschedule", return_value=None), \
+             patch.object(reschedule, "sleep") as sleep:
+            reschedule.reschedule_with_new_session()
+        browser.assert_called_once()
+        login.assert_called_once_with(driver)
+        driver.quit.assert_called_once()
+        self.assertEqual(client.prepare_session.call_count, 2)
+        sleep.assert_called_once_with(4)
 
     def test_unverified_post_stops_main_without_new_session(self):
         with patch.object(reschedule, "validate_settings"), \

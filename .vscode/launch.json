@@ -1,0 +1,31 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Rescheduler (test mode)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/reschedule.py",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "justMyCode": true,
+      "env": {
+        "TEST_MODE": "true",
+        "RUN_ONCE": "true",
+        "NEW_SESSION_AFTER_FAILURES": "1"
+      }
+    },
+    {
+      "name": "Python: Unit tests",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "unittest",
+      "args": ["discover", "-s", "tests/unit", "-t", ".", "-v"],
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "cwd": "${workspaceFolder}",
+      "console": "internalConsole",
+      "justMyCode": true
+    }
+  ]
+}
