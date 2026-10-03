@@ -10,7 +10,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 from appointment_client import (
-    AppointmentClient, AuthenticationExpired, BookingNotVerified, PortalError,
+    AppointmentClient, AuthenticationExpired, BookingNotVerified, PortalError, RateLimited,
     acceptable_dates,
 )
 from notifications import send_notification
@@ -165,14 +165,41 @@ def get_available_dates(client: AppointmentClient, request_tracker: RequestTrack
     request_tracker.retry()
     try:
         return client.get_available_dates()
-    except AuthenticationExpired:
+    except (AuthenticationExpired, RateLimited):
         raise
     except PortalError as error:
         log_message(str(error))
         return None
 
 
-def reschedule(client: AppointmentClient, retryCount: int = 0):
+class RateLimitExhausted(PortalError):
+    """All rate-limit cooldowns were used without recovery."""
+
+
+class RateLimitBackoff:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.delay = 4
+
+    @property
+    def active(self):
+        return self.delay > 4
+
+    def wait(self, error):
+        if self.delay > 4096:
+            raise RateLimitExhausted(
+                "Portal still returns HTTP 429 after cooldowns from 4 to 4096 seconds; stopping."
+            )
+        delay = max(self.delay, error.retry_after)
+        self.delay *= 2
+        log_message(f"Rate limited; waiting {delay:g} seconds before another request")
+        sleep(delay)
+
+
+def reschedule(client: AppointmentClient, retryCount: int = 0, backoff=None):
+    backoff = backoff if backoff is not None else RateLimitBackoff()
     date_request_tracker = RequestTracker(
         retryCount if retryCount > 0 else DATE_REQUEST_MAX_RETRY,
         DATE_REQUEST_MAX_TIME,
@@ -181,22 +208,33 @@ def reschedule(client: AppointmentClient, retryCount: int = 0):
     latest = date.fromisoformat(LATEST_ACCEPTABLE_DATE)
     exclusions = [(date.fromisoformat(start), date.fromisoformat(end))
                   for start, end in EXCLUSION_DATE_RANGES]
-    while date_request_tracker.should_retry():
-        dates = get_available_dates(client, date_request_tracker)
+    # Finish an ongoing backoff sequence even if ordinary polling limits expire.
+    while backoff.active or date_request_tracker.should_retry():
+        try:
+            dates = get_available_dates(client, date_request_tracker)
+        except RateLimited as error:
+            backoff.wait(error)
+            continue
         if dates is None:
             sleep(DATE_REQUEST_DELAY)
             continue
         if not dates:
-            log_message("Portal returned no available dates (an empty list can also mean rate limiting)")
+            backoff.reset()
+            log_message("Portal returned HTTP 200 with no available dates; rate limiting cannot be determined from an empty list alone")
             sleep(DATE_REQUEST_DELAY)
             continue
         candidates = acceptable_dates(dates, earliest, latest, exclusions)
         if not candidates:
             log_message(f"No dates match the configured range/exclusions; earliest available: {dates[0]}")
+        rate_limited = False
         for day in candidates:
             log_message(f"Checking appointment times on {day}")
             try:
                 result = client.book(day, dry_run=TEST_MODE)
+            except RateLimited as error:
+                backoff.wait(error)
+                rate_limited = True
+                break
             except (AuthenticationExpired, BookingNotVerified):
                 raise
             except PortalError as error:
@@ -226,6 +264,9 @@ def reschedule(client: AppointmentClient, retryCount: int = 0):
                     f"{result.date} at {result.time}, {USER_CONSULATE}.",
                 )
             return result
+        if rate_limited:
+            continue
+        backoff.reset()
         sleep(DATE_REQUEST_DELAY)
     return None
 
@@ -237,13 +278,15 @@ def close_driver(driver):
         log_message(f"Browser cleanup failed ({type(error).__name__})")
 
 
-def run_http_session(client, retryCount, cache=None, validate_session=False):
+def run_http_session(client, retryCount, cache=None, validate_session=False, backoff=None):
     session_valid = True
     try:
         if validate_session:
             client.check_session()
             log_message("Saved login session is valid; Selenium login was skipped")
-        return reschedule(client, retryCount)
+        if backoff is None:
+            return reschedule(client, retryCount)
+        return reschedule(client, retryCount, backoff)
     except AuthenticationExpired:
         session_valid = False
         if cache is not None:
@@ -255,15 +298,17 @@ def run_http_session(client, retryCount, cache=None, validate_session=False):
             cache.save(client)
 
 
-def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY):
+def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY, backoff=None):
     cache = SessionCache(SESSION_CACHE_DIR, USER_EMAIL) if PERSIST_SESSION else None
     if cache is not None:
         client = cache.load(CONSULATES[USER_CONSULATE], USER_CONSULATE, HTTP_TIMEOUT)
         if client is not None:
             try:
                 with client:
-                    return run_http_session(client, retryCount, cache, validate_session=True)
+                    return run_http_session(client, retryCount, cache, validate_session=True, backoff=backoff)
             except AuthenticationExpired:
+                if RUN_ONCE:
+                    raise
                 log_message("Saved login session expired; logging in again with Selenium")
     driver = get_chrome_driver()
     try:
@@ -286,7 +331,7 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY):
             close_driver(driver)
             driver = None
             log_message("Selenium login completed; availability and booking now use requests")
-            return run_http_session(client, retryCount, cache)
+            return run_http_session(client, retryCount, cache, backoff=backoff)
     finally:
         if driver is not None:
             close_driver(driver)
@@ -304,17 +349,30 @@ def main():
     gmail_enabled = all((GMAIL_EMAIL, GMAIL_APPLICATION_PWD, RECEIVER_EMAIL))
     log_message(f"Gmail notifications: {'enabled' if gmail_enabled else 'disabled'}")
     session_count = 0
+    backoff = RateLimitBackoff()
     try:
         while True:
             session_count += 1
             log_message(f"Attempting with new session #{session_count}")
             session_failed = False
             try:
-                result = reschedule_with_new_session()
+                result = reschedule_with_new_session(backoff=backoff)
+            except RateLimitExhausted:
+                raise
+            except RateLimited as error:
+                backoff.wait(error)
+                session_failed = True
+                result = None
             except BookingNotVerified as error:
                 log_message(str(error))
                 send_notification("Visa booking needs manual verification", str(error))
                 return 1
+            except AuthenticationExpired as error:
+                log_message(str(error))
+                if RUN_ONCE:
+                    return 1
+                log_message("Session expired; restarting Selenium login")
+                continue
             except (PortalError, WebDriverException) as error:
                 log_message(f"Session failed: {error}")
                 session_failed = True
@@ -325,6 +383,12 @@ def main():
                 log_message("Single session finished without a suitable slot")
                 return 1 if session_failed else 0
             sleep(NEW_SESSION_DELAY)
+    except RateLimitExhausted as error:
+        log_message(str(error))
+        delivered = send_notification("Visa rescheduler stopped: rate limit", str(error))
+        if not delivered:
+            log_message("Rate-limit email could not be sent; check Gmail notification settings and logs")
+        return 1
     except KeyboardInterrupt:
         log_message("Stopped by user")
         return 0

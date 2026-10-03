@@ -13,7 +13,7 @@ from appointment_client import (
     AppointmentClient, AuthenticationExpired, BookingNotVerified, BookingResult, PortalError,
 )
 from session_cache import SessionCache
-from test_booking import DAY, NoNetworkTest, URL
+from tests.unit.test_booking import DAY, NoNetworkTest, URL
 
 
 class SessionCacheTests(NoNetworkTest):
@@ -125,6 +125,7 @@ class SessionReuseTests(NoNetworkTest):
         super().setUp()
         configuration = {
             "PERSIST_SESSION": True, "USER_EMAIL": "test@example.com",
+            "RUN_ONCE": False,
             "USER_CONSULATE": "Vancouver", "FAIL_RETRY_DELAY": 0,
             "NEW_SESSION_AFTER_FAILURES": 1,
         }
@@ -176,6 +177,16 @@ class SessionReuseTests(NoNetworkTest):
         browser.assert_called_once()
         login.assert_called_once_with(driver)
         driver.quit.assert_called_once()
+
+    def test_run_once_does_not_restart_login_for_expired_saved_session(self):
+        self.cached_client.check_session.side_effect = AuthenticationExpired("HTTP 401")
+        with patch.object(reschedule, "RUN_ONCE", True), \
+             patch.object(reschedule, "SessionCache", return_value=self.cache), \
+             patch.object(reschedule, "get_chrome_driver") as browser:
+            with self.assertRaises(AuthenticationExpired):
+                reschedule.reschedule_with_new_session()
+        browser.assert_not_called()
+        self.cache.invalidate.assert_called_once()
 
     def test_expiry_during_http_polling_also_falls_back_to_selenium(self):
         driver = Mock()

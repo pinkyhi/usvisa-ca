@@ -2,7 +2,8 @@
 
 import re
 from dataclasses import dataclass
-from datetime import date, time
+from datetime import date, time, datetime, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlsplit
 
 import requests
@@ -15,6 +16,23 @@ class PortalError(RuntimeError):
 
 class AuthenticationExpired(PortalError):
     """A new browser login is required."""
+
+
+class RateLimited(PortalError):
+    """The portal requires a pause before another request."""
+
+    def __init__(self, retry_after=None):
+        super().__init__("Portal GET returned HTTP 429 (rate limited)")
+        self.retry_after = 0
+        if retry_after is not None:
+            try:
+                self.retry_after = max(0, int(retry_after))
+            except (ValueError, TypeError):
+                try:
+                    until = parsedate_to_datetime(retry_after)
+                    self.retry_after = max(0, (until - datetime.now(timezone.utc)).total_seconds())
+                except (ValueError, TypeError, OverflowError):
+                    pass
 
 
 class BookingNotVerified(PortalError):
@@ -147,6 +165,8 @@ class AppointmentClient:
             response = self.session.get(url, timeout=self.timeout, **kwargs)
         except requests.RequestException as error:
             raise PortalError(f"Portal GET failed ({type(error).__name__})") from error
+        if response.status_code == 429:
+            raise RateLimited(response.headers.get("Retry-After"))
         if "/users/sign_in" in response.url or response.status_code in {401, 403}:
             raise AuthenticationExpired("HTTP session expired or was rejected; a new login is needed")
         if response.status_code != 200:
@@ -298,6 +318,10 @@ class AppointmentClient:
         ):
             try:
                 response = self._get(url, headers={"Cache-Control": "no-cache"})
+            except RateLimited:
+                # A POST may already have succeeded. Stop for manual verification
+                # rather than issue another GET or retry the booking.
+                return False
             except PortalError:
                 continue
             if not account_page and urlsplit(response.url).path.rstrip("/") != urlsplit(url).path:

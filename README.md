@@ -86,6 +86,27 @@ the saved date, time and consulate. `TEST_MODE=true` (default) prepares the form
 without submitting it; set `TEST_MODE=false` in `.env` for real booking.
 An unverified booking stops the script for manual checking.
 
+Configure polling in `.env` (delays are in seconds):
+
+```dotenv
+DATE_REQUEST_DELAY=180       # Pause between availability checks
+DATE_REQUEST_MAX_RETRY=5     # Maximum checks per ordinary polling cycle
+NEW_SESSION_DELAY=300       # Pause between cycles with RUN_ONCE=false
+```
+
+Restart the script after changing these values. The cycle also has a time limit
+of `DATE_REQUEST_MAX_TIME=900` seconds by default.
+
+HTTP 429 responses trigger cooldowns of 4, 8, 16, 32, 64, 128, 256, 512, 1024,
+2048 and 4096 seconds. A further 429 sends a Gmail notification and stops the
+program with exit code 1. `Retry-After` seconds or HTTP dates can extend a cooldown.
+Backoff persists across session cycles and resets after an availability cycle
+without throttling. An active backoff sequence continues beyond ordinary polling
+retry/time limits. Empty HTTP 200 availability alone cannot distinguish no slots
+from hidden throttling. Booking POSTs are never automatically retried.
+Expired authentication restarts Selenium login with `RUN_ONCE=false`; with
+`RUN_ONCE=true`, an expired session ends the run instead.
+
 With `PERSIST_SESSION=true` (default), cookies and the appointment URL are saved
 per account in `.sessions/` (ignored by Git). Valid sessions skip Selenium on
 later runs; expired sessions log in again. Set `PERSIST_SESSION=false` to disable.
@@ -93,8 +114,18 @@ later runs; expired sessions log in again. Set `PERSIST_SESSION=false` to disabl
 Gmail is optional. Set the sender address in `GMAIL_EMAIL`, a
 [Google App Password](https://support.google.com/accounts/answer/185833) in
 `GMAIL_APPLICATION_PWD`, and the recipient in `RECEIVER_EMAIL`. Check it separately
-with `python tests/test_check_gmail.py`; this sends one real test email. Run offline checks
-with `python -m unittest discover -s tests -q`.
+with `python tests/integration/test_check_gmail.py`; this sends one real test email.
+
+Unit tests live in `tests/unit` and use mocked portal/SMTP responses. Run them with:
+
+```sh
+python -m unittest discover -s tests/unit -t . -v
+```
+
+Integration tests live in `tests/integration`. The Gmail test uses the real `.env`
+and sends email when run directly. To enable it through unittest discovery, set
+`RUN_GMAIL_INTEGRATION=true` and run `python -m unittest discover -s tests/integration -t . -v`.
+Ordinary discovery without this flag skips the live test.
 
 Note `detect_and_notify.py` is no longer maintained.
 
