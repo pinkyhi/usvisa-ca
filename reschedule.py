@@ -84,47 +84,74 @@ class RateLimitExhausted(PortalError):
 
 class RateLimitBackoff:
     def __init__(self):
+        self.empty_delay = EMPTY_DATES_BACKOFF_INITIAL_DELAY
         self.reset()
 
     def reset(self):
-        self.delay = 4
+        self.delay = RATE_LIMIT_BACKOFF_INITIAL_DELAY
 
-    def wait(self, error):
-        if self.delay > 4096:
+    def wait(self, error, minimum_delay=0):
+        if self.delay > RATE_LIMIT_BACKOFF_MAX_DELAY:
             raise RateLimitExhausted(
-                "Portal still returns HTTP 429 after cooldowns from 4 to 4096 seconds; stopping."
+                f"Portal still returns HTTP 429 after cooldowns from "
+                f"{RATE_LIMIT_BACKOFF_INITIAL_DELAY} to {RATE_LIMIT_BACKOFF_MAX_DELAY} seconds; stopping."
             )
-        delay = max(self.delay, error.retry_after)
-        self.delay *= 2
+        delay = max(self.delay, error.retry_after, minimum_delay)
+        self.delay = (RATE_LIMIT_BACKOFF_MAX_DELAY + 1
+                      if self.delay == RATE_LIMIT_BACKOFF_MAX_DELAY
+                      else min(self.delay * RATE_LIMIT_BACKOFF_MULTIPLIER, RATE_LIMIT_BACKOFF_MAX_DELAY))
         log_message(f"Rate limited; waiting {delay:g} seconds before another request")
+        sleep(delay)
+
+    def wait_empty(self, minimum_delay=0):
+        delay = max(self.empty_delay, minimum_delay)
+        self.empty_delay = min(self.empty_delay * EMPTY_DATES_BACKOFF_MULTIPLIER,
+                               EMPTY_DATES_BACKOFF_MAX_DELAY)
+        log_message(f"Empty dates; waiting {delay:g} seconds before another request")
         sleep(delay)
 
 
 def reschedule(client: AppointmentClient, backoff=None):
     backoff = backoff if backoff is not None else RateLimitBackoff()
+    checks_in_cycle = 0
+
+    def wait_for_next_check(reason=None):
+        nonlocal checks_in_cycle
+        delay = DATE_REQUEST_DELAY if reason is None else 0
+        if DATE_REQUEST_CYCLE_LENGTH and checks_in_cycle >= DATE_REQUEST_CYCLE_LENGTH:
+            checks_in_cycle = 0
+            delay = DATE_REQUEST_CYCLE_GAP
+            log_message(f"Date request cycle finished; next cycle in {delay} seconds")
+        if reason == "empty":
+            backoff.wait_empty(minimum_delay=delay)
+        elif reason is not None:
+            backoff.wait(reason, minimum_delay=delay)
+        else:
+            sleep(delay)
     earliest = date.fromisoformat(EARLIEST_ACCEPTABLE_DATE)
     latest = date.fromisoformat(LATEST_ACCEPTABLE_DATE)
     exclusions = [(date.fromisoformat(start), date.fromisoformat(end))
                   for start, end in EXCLUSION_DATE_RANGES]
     while True:
+        checks_in_cycle += 1
         try:
             dates = get_available_dates(client)
         except RateLimited as error:
             if RUN_ONCE:
                 raise
-            backoff.wait(error)
+            wait_for_next_check(error)
             continue
         if dates is None:
             if RUN_ONCE:
                 return None
-            sleep(DATE_REQUEST_DELAY)
+            wait_for_next_check()
             continue
         if not dates:
             backoff.reset()
             log_message("Portal returned HTTP 200 with no available dates; rate limiting cannot be determined from an empty list alone")
             if RUN_ONCE:
                 return None
-            sleep(DATE_REQUEST_DELAY)
+            wait_for_next_check("empty")
             continue
         candidates = acceptable_dates(dates, earliest, latest, exclusions)
         if not candidates:
@@ -137,7 +164,7 @@ def reschedule(client: AppointmentClient, backoff=None):
             except RateLimited as error:
                 if RUN_ONCE:
                     raise
-                backoff.wait(error)
+                wait_for_next_check(error)
                 rate_limited = True
                 break
             except (AuthenticationExpired, BookingNotVerified):
@@ -174,7 +201,7 @@ def reschedule(client: AppointmentClient, backoff=None):
         backoff.reset()
         if RUN_ONCE:
             return None
-        sleep(DATE_REQUEST_DELAY)
+        wait_for_next_check()
 
 
 def close_driver(driver):

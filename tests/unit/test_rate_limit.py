@@ -11,6 +11,14 @@ from appointment_client import AppointmentClient, AuthenticationExpired, RateLim
 
 
 class RateLimitTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.multiple(reschedule, DATE_REQUEST_CYCLE_LENGTH=0,
+            RATE_LIMIT_BACKOFF_INITIAL_DELAY=4, RATE_LIMIT_BACKOFF_MAX_DELAY=4096,
+            RATE_LIMIT_BACKOFF_MULTIPLIER=2, EMPTY_DATES_BACKOFF_INITIAL_DELAY=240,
+            EMPTY_DATES_BACKOFF_MAX_DELAY=3840, EMPTY_DATES_BACKOFF_MULTIPLIER=2)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_429_preserves_session_and_parses_retry_after(self):
         session = Mock()
         client = AppointmentClient(session,
@@ -56,7 +64,7 @@ class RateLimitTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 reschedule.reschedule(client)
         self.assertEqual([call.args[0] for call in sleep.call_args_list],
-                         [4, 8, 1000, 180, 4, 180])
+                         [4, 8, 1000, 240, 4, 480])
         client.book.assert_not_called()
 
     def test_time_endpoint_throttling_also_doubles_without_booking_retry(self):
@@ -137,3 +145,56 @@ class RateLimitTests(unittest.TestCase):
         run.assert_called_once()
         client.get_available_dates.assert_called_once()
         sleep.assert_not_called()
+
+    def test_empty_dates_cap_persists_after_nonempty_reply(self):
+        client = Mock()
+        client.get_available_dates.side_effect = ([[]] * 6
+            + [[date(2027, 1, 1)], [], KeyboardInterrupt()])
+        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=180,
+                EARLIEST_ACCEPTABLE_DATE="2026-11-01", LATEST_ACCEPTABLE_DATE="2026-12-01",
+                EXCLUSION_DATE_RANGES=[]), patch.object(reschedule, "sleep") as sleep, \
+                patch.object(reschedule, "log_message"):
+            with self.assertRaises(KeyboardInterrupt):
+                reschedule.reschedule(client)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list],
+                         [240, 480, 960, 1920, 3840, 3840, 180, 3840])
+        client.book.assert_not_called()
+
+    def test_empty_delay_survives_reauthentication(self):
+        delays = []
+        def attempt(*, backoff):
+            delays.append(backoff.empty_delay)
+            if len(delays) == 1:
+                backoff.wait_empty()
+                raise AuthenticationExpired("HTTP 401")
+            return object()
+        with patch.object(reschedule, "RUN_ONCE", False), \
+             patch.object(reschedule, "validate_settings"), \
+             patch.object(reschedule, "log_message"), \
+             patch.object(reschedule, "sleep") as sleep, \
+             patch.object(reschedule, "reschedule_with_new_session", side_effect=attempt):
+            self.assertEqual(reschedule.main(), 0)
+        self.assertEqual(delays, [240, 480])
+        sleep.assert_called_once_with(240)
+
+    def test_custom_429_backoff_reaches_cap_then_stops(self):
+        with patch.multiple(reschedule, RATE_LIMIT_BACKOFF_INITIAL_DELAY=3,
+                RATE_LIMIT_BACKOFF_MAX_DELAY=10, RATE_LIMIT_BACKOFF_MULTIPLIER=3), \
+             patch.object(reschedule, "sleep") as sleep, patch.object(reschedule, "log_message"):
+            backoff = reschedule.RateLimitBackoff()
+            for _ in range(3):
+                backoff.wait(RateLimited())
+            with self.assertRaises(reschedule.RateLimitExhausted):
+                backoff.wait(RateLimited())
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [3, 9, 10])
+
+    def test_empty_backoff_and_cycle_gap_use_longer_pause(self):
+        client = Mock()
+        client.get_available_dates.side_effect = [[], [], [], KeyboardInterrupt()]
+        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_CYCLE_LENGTH=1,
+                DATE_REQUEST_CYCLE_GAP=900, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
+                LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
+             patch.object(reschedule, "sleep") as sleep, patch.object(reschedule, "log_message"):
+            with self.assertRaises(KeyboardInterrupt):
+                reschedule.reschedule(client)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [900, 900, 960])

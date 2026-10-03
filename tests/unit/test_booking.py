@@ -267,6 +267,7 @@ class RunnerTests(NoNetworkTest):
             "EARLIEST_ACCEPTABLE_DATE": "2026-11-12", "LATEST_ACCEPTABLE_DATE": "2026-12-20",
             "EXCLUSION_DATE_RANGES": [], "USER_CONSULATE": "Vancouver", "TEST_MODE": True,
             "DATE_REQUEST_DELAY": 0,
+            "DATE_REQUEST_CYCLE_LENGTH": 0,
             "RUN_ONCE": True, "FAIL_RETRY_DELAY": 0,
             "NEW_SESSION_AFTER_FAILURES": 1,
             "PERSIST_SESSION": False,
@@ -291,7 +292,7 @@ class RunnerTests(NoNetworkTest):
 
     def test_continuous_polling_uses_same_client_every_240_seconds(self):
         client = Mock()
-        client.get_available_dates.side_effect = [[]] * 7 + [[DAY]]
+        client.get_available_dates.side_effect = [[date(2027, 1, 1)]] * 7 + [[DAY]]
         client.book.return_value = BookingResult(DAY, "08:30", True)
         with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=240), \
              patch.object(reschedule, "sleep") as sleep, \
@@ -309,6 +310,19 @@ class RunnerTests(NoNetworkTest):
         self.assertTrue(result.dry_run)
         self.assertTrue(notify.call_args.args[0].startswith("[TEST]"))
         self.assertEqual(client.book.call_count, 2)
+
+    def test_cycles_pause_after_five_ordinary_checks_and_reuse_client(self):
+        client = Mock()
+        client.get_available_dates.side_effect = [[date(2027, 1, 1)]] * 10 + [[DAY]]
+        client.book.return_value = BookingResult(DAY, "08:30", True)
+        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=180,
+                DATE_REQUEST_CYCLE_LENGTH=5, DATE_REQUEST_CYCLE_GAP=900), \
+             patch.object(reschedule, "sleep") as sleep, \
+             patch.object(reschedule, "send_notification"):
+            self.assertIsNotNone(reschedule.reschedule(client))
+        self.assertEqual(client.get_available_dates.call_count, 11)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list],
+                         ([180] * 4 + [900]) * 2)
 
     def test_gmail_failure_does_not_retry_verified_booking(self):
         client = Mock()

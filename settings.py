@@ -63,6 +63,14 @@ TIMEOUT = int(os.getenv("TIMEOUT", "10"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 FAIL_RETRY_DELAY = int(os.getenv("FAIL_RETRY_DELAY", "180"))
 DATE_REQUEST_DELAY = int(os.getenv("DATE_REQUEST_DELAY", "240"))
+DATE_REQUEST_CYCLE_LENGTH = int(os.getenv("DATE_REQUEST_CYCLE_LENGTH", "0"))
+DATE_REQUEST_CYCLE_GAP = int(os.getenv("DATE_REQUEST_CYCLE_GAP", "900"))
+RATE_LIMIT_BACKOFF_INITIAL_DELAY = int(os.getenv("RATE_LIMIT_BACKOFF_INITIAL_DELAY", "4"))
+RATE_LIMIT_BACKOFF_MAX_DELAY = int(os.getenv("RATE_LIMIT_BACKOFF_MAX_DELAY", "4096"))
+RATE_LIMIT_BACKOFF_MULTIPLIER = int(os.getenv("RATE_LIMIT_BACKOFF_MULTIPLIER", "2"))
+EMPTY_DATES_BACKOFF_INITIAL_DELAY = int(os.getenv("EMPTY_DATES_BACKOFF_INITIAL_DELAY", "240"))
+EMPTY_DATES_BACKOFF_MAX_DELAY = int(os.getenv("EMPTY_DATES_BACKOFF_MAX_DELAY", "3840"))
+EMPTY_DATES_BACKOFF_MULTIPLIER = int(os.getenv("EMPTY_DATES_BACKOFF_MULTIPLIER", "2"))
 
 LOGIN_URL = "https://ais.usvisa-info.com/en-ca/niv/users/sign_in"
 APPOINTMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/appointment"
@@ -98,6 +106,13 @@ def validate_settings():
                  "HTTP_TIMEOUT"):
         if globals()[name] <= 0:
             raise ValueError(f"{name} must be positive")
-    for name in ("FAIL_RETRY_DELAY", "DATE_REQUEST_DELAY"):
+    for name in ("FAIL_RETRY_DELAY", "DATE_REQUEST_DELAY",
+                 "DATE_REQUEST_CYCLE_LENGTH", "DATE_REQUEST_CYCLE_GAP"):
         if globals()[name] < 0:
             raise ValueError(f"{name} must not be negative")
+    for prefix in ("RATE_LIMIT_BACKOFF", "EMPTY_DATES_BACKOFF"):
+        initial = globals()[prefix + "_INITIAL_DELAY"]
+        maximum = globals()[prefix + "_MAX_DELAY"]
+        multiplier = globals()[prefix + "_MULTIPLIER"]
+        if initial <= 0 or maximum < initial or multiplier < 2:
+            raise ValueError(f"{prefix} requires 0 < INITIAL_DELAY <= MAX_DELAY and MULTIPLIER >= 2")
