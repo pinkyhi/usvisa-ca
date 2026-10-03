@@ -65,12 +65,13 @@ FAIL_RETRY_DELAY = int(os.getenv("FAIL_RETRY_DELAY", "180"))
 DATE_REQUEST_DELAY = int(os.getenv("DATE_REQUEST_DELAY", "240"))
 DATE_REQUEST_CYCLE_LENGTH = int(os.getenv("DATE_REQUEST_CYCLE_LENGTH", "0"))
 DATE_REQUEST_CYCLE_GAP = int(os.getenv("DATE_REQUEST_CYCLE_GAP", "900"))
-RATE_LIMIT_BACKOFF_INITIAL_DELAY = int(os.getenv("RATE_LIMIT_BACKOFF_INITIAL_DELAY", "4"))
-RATE_LIMIT_BACKOFF_MAX_DELAY = int(os.getenv("RATE_LIMIT_BACKOFF_MAX_DELAY", "4096"))
-RATE_LIMIT_BACKOFF_MULTIPLIER = int(os.getenv("RATE_LIMIT_BACKOFF_MULTIPLIER", "2"))
-EMPTY_DATES_BACKOFF_INITIAL_DELAY = int(os.getenv("EMPTY_DATES_BACKOFF_INITIAL_DELAY", "240"))
-EMPTY_DATES_BACKOFF_MAX_DELAY = int(os.getenv("EMPTY_DATES_BACKOFF_MAX_DELAY", "3840"))
-EMPTY_DATES_BACKOFF_MULTIPLIER = int(os.getenv("EMPTY_DATES_BACKOFF_MULTIPLIER", "2"))
+# Delays are seconds; any missing, blank or zero parameter disables its backoff.
+RATE_LIMIT_BACKOFF_INITIAL_DELAY = int(os.getenv("RATE_LIMIT_BACKOFF_INITIAL_DELAY") or "0")
+RATE_LIMIT_BACKOFF_MAX_DELAY = int(os.getenv("RATE_LIMIT_BACKOFF_MAX_DELAY") or "0")
+RATE_LIMIT_BACKOFF_MULTIPLIER = int(os.getenv("RATE_LIMIT_BACKOFF_MULTIPLIER") or "0")
+EMPTY_DATES_BACKOFF_INITIAL_DELAY = int(os.getenv("EMPTY_DATES_BACKOFF_INITIAL_DELAY") or "0")
+EMPTY_DATES_BACKOFF_MAX_DELAY = int(os.getenv("EMPTY_DATES_BACKOFF_MAX_DELAY") or "0")
+EMPTY_DATES_BACKOFF_MULTIPLIER = int(os.getenv("EMPTY_DATES_BACKOFF_MULTIPLIER") or "0")
 
 LOGIN_URL = "https://ais.usvisa-info.com/en-ca/niv/users/sign_in"
 APPOINTMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/appointment"
@@ -114,5 +115,9 @@ def validate_settings():
         initial = globals()[prefix + "_INITIAL_DELAY"]
         maximum = globals()[prefix + "_MAX_DELAY"]
         multiplier = globals()[prefix + "_MULTIPLIER"]
-        if initial <= 0 or maximum < initial or multiplier < 2:
+        if min(initial, maximum, multiplier) < 0:
+            raise ValueError(f"{prefix} parameters must not be negative")
+        if 0 in (initial, maximum, multiplier):
+            continue
+        if maximum < initial or multiplier < 2:
             raise ValueError(f"{prefix} requires 0 < INITIAL_DELAY <= MAX_DELAY and MULTIPLIER >= 2")

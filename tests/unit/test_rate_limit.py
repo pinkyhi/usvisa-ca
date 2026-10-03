@@ -198,3 +198,41 @@ class RateLimitTests(unittest.TestCase):
             with self.assertRaises(KeyboardInterrupt):
                 reschedule.reschedule(client)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [900, 900, 960])
+
+    def test_zero_parameter_disables_only_its_backoff(self):
+        for prefix in ("RATE_LIMIT_BACKOFF", "EMPTY_DATES_BACKOFF"):
+            for suffix in ("INITIAL_DELAY", "MAX_DELAY", "MULTIPLIER"):
+                with self.subTest(prefix=prefix, suffix=suffix), \
+                     patch.object(reschedule, f"{prefix}_{suffix}", 0), \
+                     patch.object(reschedule, "sleep") as sleep, \
+                     patch.object(reschedule, "log_message"):
+                    backoff = reschedule.RateLimitBackoff()
+                    self.assertEqual(backoff.rate_limit_enabled, prefix != "RATE_LIMIT_BACKOFF")
+                    self.assertEqual(backoff.empty_enabled, prefix != "EMPTY_DATES_BACKOFF")
+                    for _ in range(15):
+                        if prefix == "RATE_LIMIT_BACKOFF":
+                            backoff.wait(RateLimited())
+                        else:
+                            backoff.wait_empty()
+                    sleep.assert_not_called()
+                    if prefix == "RATE_LIMIT_BACKOFF":
+                        backoff.wait(RateLimited("600"), minimum_delay=180)
+                        sleep.assert_called_once_with(600)
+                    else:
+                        backoff.wait_empty(minimum_delay=180)
+                        sleep.assert_called_once_with(180)
+
+    def test_disabled_backoffs_use_polling_delay_and_cycle_gap(self):
+        client = Mock()
+        client.get_available_dates.side_effect = [
+            RateLimited(), [], RateLimited("600"), [], KeyboardInterrupt(),
+        ]
+        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=180,
+                DATE_REQUEST_CYCLE_LENGTH=2, DATE_REQUEST_CYCLE_GAP=900,
+                RATE_LIMIT_BACKOFF_INITIAL_DELAY=0, EMPTY_DATES_BACKOFF_INITIAL_DELAY=0,
+                EARLIEST_ACCEPTABLE_DATE="2026-11-01", LATEST_ACCEPTABLE_DATE="2026-12-01",
+                EXCLUSION_DATE_RANGES=[]), patch.object(reschedule, "sleep") as sleep, \
+                patch.object(reschedule, "log_message"):
+            with self.assertRaises(KeyboardInterrupt):
+                reschedule.reschedule(client)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [180, 900, 600, 900])

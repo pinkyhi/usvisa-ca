@@ -120,12 +120,17 @@ program with exit code 1. `Retry-After` seconds or HTTP dates can extend a coold
 Backoff persists across reauthentication and resets after an availability check
 without throttling. Empty HTTP 200 availability alone cannot distinguish no slots
 from hidden throttling. Booking POSTs are never automatically retried.
-Empty dates trigger separate pauses of 4, 8, 16, 32 and then 64 minutes repeatedly.
+Empty dates trigger separate pauses of 240, 480, 960, 1920 and then 3840 seconds repeatedly.
 The empty-response backoff never resets during the process, even after nonempty
 replies or reauthentication. Nonempty replies still use ordinary polling delays.
 Both backoffs restart when the program restarts. Errors and empty responses count
 toward cycles; at a cycle boundary the longer applicable pause is used, without
 adding the cycle gap to backoff. `RUN_ONCE` never waits or retries.
+Each backoff is enabled only when all three of its parameters are present and
+positive. Setting any parameter to `0`, leaving it blank or omitting it disables
+that backoff, including the stop after exhausted HTTP 429 cooldowns. Disabled
+backoffs use the ordinary polling delay and cycle gap; HTTP 429 still respects
+`Retry-After`. Initial and maximum delays are in seconds; multipliers are unitless.
 Expired authentication restarts Selenium login with `RUN_ONCE=false`; with
 `RUN_ONCE=true`, an expired session ends the run instead.
 

@@ -84,6 +84,14 @@ class RateLimitExhausted(PortalError):
 
 class RateLimitBackoff:
     def __init__(self):
+        self.rate_limit_enabled = all(value > 0 for value in (
+            RATE_LIMIT_BACKOFF_INITIAL_DELAY, RATE_LIMIT_BACKOFF_MAX_DELAY,
+            RATE_LIMIT_BACKOFF_MULTIPLIER,
+        ))
+        self.empty_enabled = all(value > 0 for value in (
+            EMPTY_DATES_BACKOFF_INITIAL_DELAY, EMPTY_DATES_BACKOFF_MAX_DELAY,
+            EMPTY_DATES_BACKOFF_MULTIPLIER,
+        ))
         self.empty_delay = EMPTY_DATES_BACKOFF_INITIAL_DELAY
         self.reset()
 
@@ -91,6 +99,12 @@ class RateLimitBackoff:
         self.delay = RATE_LIMIT_BACKOFF_INITIAL_DELAY
 
     def wait(self, error, minimum_delay=0):
+        if not self.rate_limit_enabled:
+            delay = max(error.retry_after, minimum_delay)
+            if delay > 0:
+                log_message(f"Rate limited; waiting {delay:g} seconds before another request")
+                sleep(delay)
+            return
         if self.delay > RATE_LIMIT_BACKOFF_MAX_DELAY:
             raise RateLimitExhausted(
                 f"Portal still returns HTTP 429 after cooldowns from "
@@ -104,6 +118,11 @@ class RateLimitBackoff:
         sleep(delay)
 
     def wait_empty(self, minimum_delay=0):
+        if not self.empty_enabled:
+            if minimum_delay > 0:
+                log_message(f"Empty dates; waiting {minimum_delay:g} seconds before another request")
+                sleep(minimum_delay)
+            return
         delay = max(self.empty_delay, minimum_delay)
         self.empty_delay = min(self.empty_delay * EMPTY_DATES_BACKOFF_MULTIPLIER,
                                EMPTY_DATES_BACKOFF_MAX_DELAY)
@@ -117,7 +136,10 @@ def reschedule(client: AppointmentClient, backoff=None):
 
     def wait_for_next_check(reason=None):
         nonlocal checks_in_cycle
-        delay = DATE_REQUEST_DELAY if reason is None else 0
+        use_normal_delay = (reason is None
+                            or (reason == "empty" and not backoff.empty_enabled)
+                            or (isinstance(reason, RateLimited) and not backoff.rate_limit_enabled))
+        delay = DATE_REQUEST_DELAY if use_normal_delay else 0
         if DATE_REQUEST_CYCLE_LENGTH and checks_in_cycle >= DATE_REQUEST_CYCLE_LENGTH:
             checks_in_cycle = 0
             delay = DATE_REQUEST_CYCLE_GAP
