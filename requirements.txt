@@ -2,3 +2,4 @@ requests
 selenium
 webdriver_manager
 python-dotenv
+beautifulsoup4

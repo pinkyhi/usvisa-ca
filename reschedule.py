@@ -1,19 +1,19 @@
 import re
-import traceback
-from datetime import datetime
+from datetime import date, datetime
 from time import sleep
-from typing import Union, List
 
-import requests
 from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
-from legacy.gmail import GMail, Message
-from legacy_rescheduler import legacy_reschedule
+from appointment_client import (
+    AppointmentClient, AuthenticationExpired, BookingNotVerified, PortalError,
+    acceptable_dates,
+)
+from notifications import send_notification
 from request_tracker import RequestTracker
 from settings import *
 
@@ -25,15 +25,13 @@ def log_message(message: str) -> None:
 def get_chrome_driver() -> WebDriver:
     options = webdriver.ChromeOptions()
     if not SHOW_GUI:
-        options.add_argument("headless")
+        options.add_argument("--headless=new")
         options.add_argument("window-size=1920x1080")
         options.add_argument("disable-gpu")
-        options.add_argument('user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36')
     options.add_experimental_option("detach", DETACH)
     options.add_argument('--incognito')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
-    options.add_argument(f'--user-data-dir=/tmp/chrome-{datetime.now().strftime("%Y%m%d-%H%M%S")}')
     driver = webdriver.Chrome(options=options)
     return driver
 
@@ -61,6 +59,10 @@ def login(driver: WebDriver) -> None:
         EC.element_to_be_clickable((By.NAME, "commit"))
     )
     login_button.click()
+    WebDriverWait(driver, timeout).until(
+        EC.invisibility_of_element_located((By.ID, "user_email")),
+        message="Login did not complete; check the visa account credentials",
+    )
 
 
 def _find_visible_action(driver: WebDriver, label: str):
@@ -106,17 +108,20 @@ def _appointment_page_state(driver: WebDriver):
         return "schedule"
     if _has_visible_element(driver, (By.CLASS_NAME, "icheckbox")):
         return "policy"
+    if _find_visible_action(driver, "Continue"):
+        return "continue"
     return False
 
 
 def _prepare_appointment_page(driver: WebDriver) -> None:
     timeout = TIMEOUT
-    for _ in range(3):
+    for _ in range(5):
         state = WebDriverWait(driver, timeout).until(_appointment_page_state)
         if state == "ready":
             return
-        if state == "schedule":
-            _click_action_if_present(driver, "Schedule Appointment", timeout)
+        if state in {"schedule", "continue"}:
+            label = "Schedule Appointment" if state == "schedule" else "Continue"
+            _click_action_if_present(driver, label, timeout)
             continue
 
         policy_checkbox = WebDriverWait(driver, timeout).until(
@@ -148,138 +153,154 @@ def get_appointment_page(driver: WebDriver) -> None:
     current_url = driver.current_url
     schedule_match = re.search(r"/schedule/(\d+)", current_url)
     if not schedule_match:
-        raise RuntimeError(f"Could not find schedule id in URL: {current_url}")
+        raise PortalError("Could not find the schedule id after opening the appointment page")
 
     appointment_url = APPOINTMENT_PAGE_URL.format(id=schedule_match.group(1))
     driver.get(appointment_url)
 
 
-def get_available_dates(
-    driver: WebDriver, request_tracker: RequestTracker
-) -> Union[List[datetime.date], None]:
+def get_available_dates(client: AppointmentClient, request_tracker: RequestTracker):
     request_tracker.log_retry()
     request_tracker.retry()
-    schedule_base = driver.current_url.split("/appointment")[0]
-    request_url = schedule_base + "/appointment" + AVAILABLE_DATE_REQUEST_SUFFIX
-    request_header_cookie = "".join(
-        [f"{cookie['name']}={cookie['value']};" for cookie in driver.get_cookies()]
-    )
-    request_headers = REQUEST_HEADERS.copy()
-    request_headers["Cookie"] = request_header_cookie
-    request_headers["User-Agent"] = driver.execute_script("return navigator.userAgent")
     try:
-        response = requests.get(request_url, headers=request_headers)
-    except Exception as e:
-        log_message(f"Get available dates request failed: {e}")
+        return client.get_available_dates()
+    except AuthenticationExpired:
+        raise
+    except PortalError as error:
+        log_message(str(error))
         return None
-    if response.status_code != 200:
-        log_message(f"Failed with status code {response.status_code}")
-        log_message(f"Response Text: {response.text}")
-        return None
-    try:
-        dates_json = response.json()
-    except:
-        log_message("Failed to decode json")
-        log_message(f"Response Text: {response.text}")
-        return None
-    dates = [datetime.strptime(item["date"], "%Y-%m-%d").date() for item in dates_json]
-    return dates
 
 
-def reschedule(driver: WebDriver, retryCount: int = 0) -> bool:
+def reschedule(client: AppointmentClient, retryCount: int = 0):
     date_request_tracker = RequestTracker(
-        retryCount if (retryCount > 0) else DATE_REQUEST_MAX_RETRY,
-        DATE_REQUEST_DELAY * retryCount if (retryCount > 0) else DATE_REQUEST_MAX_TIME
+        retryCount if retryCount > 0 else DATE_REQUEST_MAX_RETRY,
+        DATE_REQUEST_MAX_TIME,
     )
+    earliest = date.fromisoformat(EARLIEST_ACCEPTABLE_DATE)
+    latest = date.fromisoformat(LATEST_ACCEPTABLE_DATE)
+    exclusions = [(date.fromisoformat(start), date.fromisoformat(end))
+                  for start, end in EXCLUSION_DATE_RANGES]
     while date_request_tracker.should_retry():
-        dates = get_available_dates(driver, date_request_tracker)
-        if not dates:
-            log_message("Error occured when requesting available dates")
+        dates = get_available_dates(client, date_request_tracker)
+        if dates is None:
             sleep(DATE_REQUEST_DELAY)
             continue
-        earliest_available_date = dates[0]
-        earliest_acceptable_date = datetime.strptime(EARLIEST_ACCEPTABLE_DATE, "%Y-%m-%d").date()
-        latest_acceptable_date = datetime.strptime(LATEST_ACCEPTABLE_DATE, "%Y-%m-%d").date()
-        if earliest_acceptable_date <= earliest_available_date <= latest_acceptable_date:
-            # Check if the earliest available date falls in any of the excluded date ranges
-            for i, (start, end) in enumerate(EXCLUSION_DATE_RANGES, 1):
-                if datetime.strptime(start, "%Y-%m-%d").date() <= earliest_available_date <= datetime.strptime(end, "%Y-%m-%d").date():
-                    log_message(f"UH OH! Date falls in excluded date range: {start} to {end}")
-                    sleep(DATE_REQUEST_DELAY)
-                    continue
-            log_message(f"FOUND SLOT ON {earliest_available_date}!!!")
-            try:
-                if legacy_reschedule(driver, earliest_available_date):
-                    gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
-                    msg = Message(
-                        f"Visa Appointment Rescheduled for {earliest_available_date}",
-                        to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
-                        text=f"Your visa appointment has been successfully rescheduled to {earliest_available_date} at {USER_CONSULATE} consulate."
-                    )
-                    gmail.send(msg)
-                    gmail.close()
-                    log_message("SUCCESSFULLY RESCHEDULED!!!")
-                    return True
-                return False
-            except Exception as e:
-                log_message(f"Rescheduling failed: {e}")
-                traceback.print_exc()
-                continue
-        else:
-            log_message(f"Earliest available date is {earliest_available_date}")
-        sleep(DATE_REQUEST_DELAY)
-    return False
-
-
-def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY) -> bool:
-    driver = get_chrome_driver()
-    session_failures = 0
-    timeout = TIMEOUT
-    while session_failures < NEW_SESSION_AFTER_FAILURES:
-        try:
-            login(driver)
-            get_appointment_page(driver)
-            _prepare_appointment_page(driver)
-            break
-        except Exception as e:
-            log_message(f"Unable to get appointment page at {driver.current_url}: {e}")
-            session_failures += 1
-            sleep(FAIL_RETRY_DELAY)
+        if not dates:
+            log_message("Portal returned no available dates (an empty list can also mean rate limiting)")
+            sleep(DATE_REQUEST_DELAY)
             continue
-    rescheduled = reschedule(driver, retryCount)
-    driver.quit()
-    if rescheduled:
-        return True
-    else:
-        return False
+        candidates = acceptable_dates(dates, earliest, latest, exclusions)
+        if not candidates:
+            log_message(f"No dates match the configured range/exclusions; earliest available: {dates[0]}")
+        for day in candidates:
+            log_message(f"Checking appointment times on {day}")
+            try:
+                result = client.book(day, dry_run=TEST_MODE)
+            except (AuthenticationExpired, BookingNotVerified):
+                raise
+            except PortalError as error:
+                log_message(f"Could not prepare booking: {error}")
+                break
+            if result is None:
+                log_message(f"No available times on {day}; checking the next suitable date")
+                continue
+            if result.dry_run:
+                log_message(
+                    f"TEST MODE: would book {result.date} at {result.time} in "
+                    f"{USER_CONSULATE}. No booking POST was sent."
+                )
+                send_notification(
+                    f"[TEST] Visa slot found for {result.date}",
+                    f"Available slot: {result.date} at {result.time}, {USER_CONSULATE}. "
+                    "The booking form was prepared, but no appointment was changed.",
+                )
+            else:
+                log_message(
+                    f"VERIFIED: appointment booked for {result.date} at "
+                    f"{result.time} in {USER_CONSULATE}"
+                )
+                send_notification(
+                    f"Visa Appointment Rescheduled for {result.date}",
+                    f"Your appointment has been verified on the portal for "
+                    f"{result.date} at {result.time}, {USER_CONSULATE}.",
+                )
+            return result
+        sleep(DATE_REQUEST_DELAY)
+    return None
+
+
+def close_driver(driver):
+    try:
+        driver.quit()
+    except WebDriverException as error:
+        log_message(f"Browser cleanup failed ({type(error).__name__})")
+
+
+def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY):
+    driver = get_chrome_driver()
+    try:
+        for attempt in range(NEW_SESSION_AFTER_FAILURES):
+            try:
+                login(driver)
+                get_appointment_page(driver)
+                _prepare_appointment_page(driver)
+                break
+            except WebDriverException as error:
+                log_message(f"Could not prepare appointment page ({type(error).__name__})")
+                if attempt + 1 == NEW_SESSION_AFTER_FAILURES:
+                    raise PortalError("Selenium could not prepare the appointment page after all login attempts") from error
+                sleep(FAIL_RETRY_DELAY)
+        with AppointmentClient.from_driver(
+            driver, CONSULATES[USER_CONSULATE], USER_CONSULATE, HTTP_TIMEOUT,
+        ) as client:
+            # The HTTP session owns its cookies now. Close Chrome to stop its
+            # background requests while polling/bookings proceed over HTTP.
+            close_driver(driver)
+            driver = None
+            log_message("Selenium login completed; availability and booking now use requests")
+            return reschedule(client, retryCount)
+    finally:
+        if driver is not None:
+            close_driver(driver)
+
+
+def main():
+    try:
+        validate_settings()
+    except ValueError as error:
+        log_message(str(error))
+        return 2
+    log_message(f"Consulate: {USER_CONSULATE}")
+    log_message(f"Acceptable dates: {EARLIEST_ACCEPTABLE_DATE} to {LATEST_ACCEPTABLE_DATE}")
+    log_message(f"TEST_MODE={TEST_MODE}; RUN_ONCE={RUN_ONCE}")
+    gmail_enabled = all((GMAIL_EMAIL, GMAIL_APPLICATION_PWD, RECEIVER_EMAIL))
+    log_message(f"Gmail notifications: {'enabled' if gmail_enabled else 'disabled'}")
+    session_count = 0
+    try:
+        while True:
+            session_count += 1
+            log_message(f"Attempting with new session #{session_count}")
+            session_failed = False
+            try:
+                result = reschedule_with_new_session()
+            except BookingNotVerified as error:
+                log_message(str(error))
+                send_notification("Visa booking needs manual verification", str(error))
+                return 1
+            except (PortalError, WebDriverException) as error:
+                log_message(f"Session failed: {error}")
+                session_failed = True
+                result = None
+            if result is not None:
+                return 0
+            if RUN_ONCE:
+                log_message("Single session finished without a suitable slot")
+                return 1 if session_failed else 0
+            sleep(NEW_SESSION_DELAY)
+    except KeyboardInterrupt:
+        log_message("Stopped by user")
+        return 0
 
 
 if __name__ == "__main__":
-    session_count = 0
-    log_message(f"Attempting to reschedule for email: {USER_EMAIL}")
-    log_message(f"User Consulate: {USER_CONSULATE}")
-    log_message(f"Earliest Acceptable Date: {EARLIEST_ACCEPTABLE_DATE}")
-    log_message(f"Latest Acceptable Date: {LATEST_ACCEPTABLE_DATE}")
-
-    if EXCLUSION_DATE_RANGES:
-        log_message("Excluded Date Ranges:")
-        for i, (start, end) in enumerate(EXCLUSION_DATE_RANGES, 1):
-            log_message(f"  Range {i}: {start} to {end}")
-    else:
-        log_message("No date ranges excluded")
-
-    while True:
-        session_count += 1
-        log_message(f"Attempting with new session #{session_count}")
-        rescheduled = reschedule_with_new_session()
-        sleep(NEW_SESSION_DELAY)
-        if rescheduled:
-            break
-    gmail = GMail(f"{GMAIL_SENDER_NAME} <{GMAIL_EMAIL}>", GMAIL_APPLICATION_PWD)
-    msg = Message(
-        f"Rescheduler Program Exited",
-        to=f"{RECEIVER_NAME} <{RECEIVER_EMAIL}>",
-        text=f"The rescheduler program has exited on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
-    )
-    gmail.send(msg)
-    gmail.close()
+    raise SystemExit(main())

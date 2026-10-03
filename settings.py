@@ -1,44 +1,33 @@
-from dotenv import load_dotenv
 import os
-from datetime import datetime
-# Load environment variables
-load_dotenv()
+from datetime import date
+from pathlib import Path
 
-# Account Info
-USER_EMAIL = os.getenv("USER_EMAIL")
-USER_PASSWORD = os.getenv("USER_PASSWORD")
-NUM_PARTICIPANTS = 1
+from dotenv import load_dotenv
 
-# Say you want an appointment no later than Mar 14, 2024
-# Please strictly follow the YYYY-MM-DD format for all dates
 
-EARLIEST_ACCEPTABLE_DATE = os.getenv("EARLIEST_ACCEPTABLE_DATE")
-LATEST_ACCEPTABLE_DATE = os.getenv("LATEST_ACCEPTABLE_DATE")
+# Always use the .env beside this file, including when launched from an IDE.
+# Explicit environment variables take precedence over the file.
+load_dotenv(Path(__file__).with_name(".env"))
 
-# Date exclusion ranges
-EXCLUSION_DATE_RANGES = []
-if EARLIEST_ACCEPTABLE_DATE and LATEST_ACCEPTABLE_DATE:
-    try:
-        earliest_acceptable_date = datetime.strptime(EARLIEST_ACCEPTABLE_DATE, "%Y-%m-%d").date()
-        latest_acceptable_date = datetime.strptime(LATEST_ACCEPTABLE_DATE, "%Y-%m-%d").date()
-        
-        for i in range(1, 10):  # Support up to 9 exclusion ranges
-            start = os.getenv(f"EXCLUSION_START_DATE_{i}")
-            end = os.getenv(f"EXCLUSION_END_DATE_{i}")
-            if start and end:
-                try:
-                    exclusion_start_date = datetime.strptime(start, "%Y-%m-%d").date()
-                    exclusion_end_date = datetime.strptime(end, "%Y-%m-%d").date()
-                    if (exclusion_start_date < exclusion_end_date and 
-                        exclusion_start_date > earliest_acceptable_date and 
-                        exclusion_end_date < latest_acceptable_date):
-                        EXCLUSION_DATE_RANGES.append((start, end))
-                except ValueError:
-                    print(f"Invalid date format in exclusion range {start} to {end}")
-    except ValueError:
-        print("Invalid date format in EARLIEST_ACCEPTABLE_DATE or LATEST_ACCEPTABLE_DATE")
 
-# Your consulate's city
+def env_bool(name, default):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    if value.lower().strip() in {"true", "1", "yes", "on"}:
+        return True
+    if value.lower().strip() in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
+USER_EMAIL = os.getenv("USER_EMAIL", "")
+USER_PASSWORD = os.getenv("USER_PASSWORD", "")
+NUM_PARTICIPANTS = int(os.getenv("NUM_PARTICIPANTS", "1"))
+EARLIEST_ACCEPTABLE_DATE = os.getenv("EARLIEST_ACCEPTABLE_DATE", "")
+LATEST_ACCEPTABLE_DATE = os.getenv("LATEST_ACCEPTABLE_DATE", "")
+USER_CONSULATE = os.getenv("USER_CONSULATE", "")
+
 CONSULATES = {
     "Calgary": 89,
     "Halifax": 90,
@@ -46,44 +35,70 @@ CONSULATES = {
     "Ottawa": 92,
     "Quebec": 93,
     "Toronto": 94,
-    "Vancouver": 95
-} # Only Toronto and Vancouver consulates are verified
-# Choose a city from the list above
-USER_CONSULATE = os.getenv("USER_CONSULATE")
+    "Vancouver": 95,
+}
 
-# The following is only required for the Gmail notification feature
-# Gmail login info
-GMAIL_SENDER_NAME = os.getenv("GMAIL_SENDER_NAME")
-GMAIL_EMAIL = os.getenv("GMAIL_EMAIL")
-GMAIL_APPLICATION_PWD = os.getenv("GMAIL_APPLICATION_PWD")
+EXCLUSION_DATE_RANGES = []
+for i in range(1, 10):
+    start = os.getenv(f"EXCLUSION_START_DATE_{i}", "")
+    end = os.getenv(f"EXCLUSION_END_DATE_{i}", "")
+    if start or end:
+        EXCLUSION_DATE_RANGES.append((start, end))
 
-# Email notification receiver info
-RECEIVER_NAME = os.getenv("RECEIVER_NAME")
-RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
+GMAIL_SENDER_NAME = os.getenv("GMAIL_SENDER_NAME", "Visa Rescheduler")
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "")
+GMAIL_APPLICATION_PWD = os.getenv("GMAIL_APPLICATION_PWD", "")
+RECEIVER_NAME = os.getenv("RECEIVER_NAME", "")
+RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "")
 
-# Override with local, for developers
-# from local import *
+# A test run logs in and prepares a booking, but never submits the booking POST.
+TEST_MODE = env_bool("TEST_MODE", True)
+SHOW_GUI = env_bool("SHOW_GUI", False)
+RUN_ONCE = env_bool("RUN_ONCE", False)
+DETACH = env_bool("DETACH", False)
+NEW_SESSION_AFTER_FAILURES = int(os.getenv("NEW_SESSION_AFTER_FAILURES", "5"))
+NEW_SESSION_DELAY = int(os.getenv("NEW_SESSION_DELAY", "300"))
+TIMEOUT = int(os.getenv("TIMEOUT", "10"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
+FAIL_RETRY_DELAY = int(os.getenv("FAIL_RETRY_DELAY", "180"))
+DATE_REQUEST_DELAY = int(os.getenv("DATE_REQUEST_DELAY", "180"))
+DATE_REQUEST_MAX_RETRY = int(os.getenv("DATE_REQUEST_MAX_RETRY", "5"))
+DATE_REQUEST_MAX_TIME = int(os.getenv("DATE_REQUEST_MAX_TIME", str(15 * 60)))
 
-# See the automation in action
-SHOW_GUI = False  # toggle to false if you don't want to see the browser
-
-# If you just want to see the program run WITHOUT clicking the confirm reschedule button
-# For testing, also set a date really far away so the app actually tries to reschedule
-TEST_MODE = False
-
-# Don't change the following unless you know what you are doing
-DETACH = True
-NEW_SESSION_AFTER_FAILURES = 5
-NEW_SESSION_DELAY = 300
-TIMEOUT = 10
-FAIL_RETRY_DELAY = 180
-DATE_REQUEST_DELAY = 180
-DATE_REQUEST_MAX_RETRY = 5
-DATE_REQUEST_MAX_TIME = 15 * 60
 LOGIN_URL = "https://ais.usvisa-info.com/en-ca/niv/users/sign_in"
-AVAILABLE_DATE_REQUEST_SUFFIX = f"/days/{CONSULATES[USER_CONSULATE]}.json?appointments[expedite]=false"
 APPOINTMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/appointment"
 PAYMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/payment"
-REQUEST_HEADERS = {
-    "X-Requested-With": "XMLHttpRequest",
-}
+# Retained for the unmaintained scripts in legacy/.
+AVAILABLE_DATE_REQUEST_SUFFIX = (
+    f"/days/{CONSULATES.get(USER_CONSULATE, '')}.json?appointments[expedite]=false"
+)
+REQUEST_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
+
+
+def validate_settings():
+    missing = [name for name in (
+        "USER_EMAIL", "USER_PASSWORD", "USER_CONSULATE",
+        "EARLIEST_ACCEPTABLE_DATE", "LATEST_ACCEPTABLE_DATE",
+    ) if not globals()[name]]
+    if missing:
+        raise ValueError("Fill these settings in .env: " + ", ".join(missing))
+    if USER_CONSULATE not in CONSULATES:
+        raise ValueError("USER_CONSULATE must be one of: " + ", ".join(CONSULATES))
+    try:
+        earliest = date.fromisoformat(EARLIEST_ACCEPTABLE_DATE)
+        latest = date.fromisoformat(LATEST_ACCEPTABLE_DATE)
+        exclusions = [(date.fromisoformat(start), date.fromisoformat(end))
+                      for start, end in EXCLUSION_DATE_RANGES]
+    except ValueError as error:
+        raise ValueError("Dates must use YYYY-MM-DD; exclusion ranges need both dates") from error
+    if earliest > latest:
+        raise ValueError("EARLIEST_ACCEPTABLE_DATE must not be after LATEST_ACCEPTABLE_DATE")
+    if any(start > end for start, end in exclusions):
+        raise ValueError("Exclusion start dates must not be after their end dates")
+    for name in ("NUM_PARTICIPANTS", "NEW_SESSION_AFTER_FAILURES", "TIMEOUT",
+                 "HTTP_TIMEOUT", "DATE_REQUEST_MAX_RETRY", "DATE_REQUEST_MAX_TIME"):
+        if globals()[name] <= 0:
+            raise ValueError(f"{name} must be positive")
+    for name in ("NEW_SESSION_DELAY", "FAIL_RETRY_DELAY", "DATE_REQUEST_DELAY"):
+        if globals()[name] < 0:
+            raise ValueError(f"{name} must not be negative")

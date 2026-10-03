@@ -5,7 +5,7 @@ A simple Python script for making US visa interview appointments in Canada
 ## Update
 
 - The core functionality is still working (as of **March 2026**) according to users' report
-- Gmail-related code might error out, but it doesn't block rescheduling
+- Gmail notifications are optional; delivery failures do not change the booking result
 - Adopt this repo: this project is looking for a new maintainer, open an issue if you'd like to adopt it.
 
 ## Features
@@ -16,7 +16,7 @@ A simple Python script for making US visa interview appointments in Canada
 - Email notifications when appointments are found or rescheduled
 - Support for excluding specific date ranges
 - Headless operation mode for unattended running
-- Test mode for safe testing without actual rescheduling
+- Test mode that prepares a booking without sending the booking POST
 - Automatic retry mechanism with configurable delays
 - Support for multiple applicants in a single appointment
 
@@ -49,36 +49,92 @@ CONSULATES = {
 } # Only Toronto and Vancouver consulates are verified
 ```
 
-Add a new `.env` file to the root of the project, this file will be used to configure parameters for the script. You can use the following parameters:
+Copy `.env.example` to `.env` in the root of the project and fill in your account,
+consulate and date range. On PowerShell:
 
-```
-USER_EMAIL=""   # The email address for your https://ais.usvisa-info.com/en-ca/niv/users/sign_in account
-USER_PASSWORD=""    # The password for your  https://ais.usvisa-info.com/en-ca/niv/users/sign_in account
-EARLIEST_ACCEPTABLE_DATE="" # The earliest interview date you are looking for
-LATEST_ACCEPTABLE_DATE=""   # The latest acceptable interview date
-USER_CONSULATE="" # Use one of the cosulate names from above
-GMAIL_SENDER_NAME=""    # Name of sender on email
-GMAIL_EMAIL=""  # Sender email account
-GMAIL_APPLICATION_PWD=""    # Use the app password you generated for application -- check https://support.google.com/mail/answer/185833?hl=en
-RECEIVER_NAME=""    # Recipient name
-RECEIVER_EMAIL=""   # Recipient email
-EXCLUSION_START_DATE_1=""   # Start date for first excluded date range
-EXCLUSION_END_DATE_1=""     # End date for first excluded date range
-EXCLUSION_START_DATE_2=""   # Start date for second excluded date range
-EXCLUSION_END_DATE_2=""     # End date for second excluded date range
+```powershell
+Copy-Item .env.example .env
 ```
 
-You can add upto 9 exclusion date ranges. Each date range to be excluded using the syntax `EXCLUSION_START_DATE_{i}` and `EXCLUSION_END_DATE_{i}` where `i` can be replaced by numbers between 1 to 9.
+If you already have a `.env`, edit it rather than replacing it. The file is
+ignored by Git and contains your credentials as plain text. Settings always load
+the `.env` beside `settings.py`; existing environment variables take precedence.
 
-### Find a slot and book it automatically
+Required settings:
+
+- `USER_EMAIL` and `USER_PASSWORD`: credentials for the visa portal, not Gmail.
+- `USER_CONSULATE`: one of the names listed above.
+- `EARLIEST_ACCEPTABLE_DATE` and `LATEST_ACCEPTABLE_DATE`: inclusive `YYYY-MM-DD` dates.
+- `NUM_PARTICIPANTS`: number of applicants (default `1`).
+
+You can exclude up to 9 inclusive date ranges with `EXCLUSION_START_DATE_1` /
+`EXCLUSION_END_DATE_1`, through `_9`. Single-day exclusions are supported.
+
+### Login and booking
 
 ```sh
 python reschedule.py
 ```
 
-See the script in action. Once you're satisfied with its functionality, set `TEST_MODE` to `False` in `settings.py`. For a headless operation, you can also set `SHOW_GUI` to `False` and allow the script to run unattended.
+Selenium opens Chrome, signs in, accepts the portal's policy and navigates through
+appointment setup. The authenticated cookies and browser user agent are copied
+into a `requests.Session` in memory, then Chrome is closed. Cookies and CSRF tokens
+are not written to disk by the application.
+
+`appointment_client.py` obtains dates, available times and a fresh appointment
+form over HTTP. It preserves the form's hidden fields and repeated applicant IDs,
+sets the chosen consulate/date/time, and submits the form with its CSRF token.
+After submitting, it separately reloads the instructions/account summary and
+checks the saved date, time and consulate for that schedule. A successful HTTP
+status or success message alone is not considered proof.
+
+If the POST times out or the saved appointment cannot be verified, the program
+checks the saved appointment and stops with exit code `1` if still unverified.
+Check your account before restarting: it does not automatically repeat a POST
+whose outcome is uncertain. Accounts requiring an additional, unfilled ASC
+appointment are rejected before booking.
+
+### Test mode
+
+- `TEST_MODE=true` (the default): real login and availability/form GETs, but no
+  booking POST. A matching slot is logged as a test, and the program exits.
+  It does not prove the server would accept a real booking.
+- `TEST_MODE=false`: submits the booking and verifies the saved appointment.
+- `SHOW_GUI=true`: shows Chrome during login/setup; `false` uses headless Chrome.
+- `RUN_ONCE=true`: stops after one browser/HTTP session, even without a matching
+  slot. The session can perform up to `DATE_REQUEST_MAX_RETRY` availability polls.
+  `false` starts new sessions until a slot is prepared/booked.
+
+The example configuration uses `TEST_MODE=true`, `SHOW_GUI=true`, `RUN_ONCE=true`
+for checking an account. Set `TEST_MODE=false` and `RUN_ONCE=false` for continuous
+automatic booking. Boolean settings accept `true`/`false` in `.env`.
+
+### Optional Gmail notifications
+
+Enable [2-Step Verification and create a Google app password](https://support.google.com/accounts/answer/185833).
+Set `GMAIL_EMAIL`, `GMAIL_APPLICATION_PWD` (the app password, not the normal Gmail
+password), and `RECEIVER_EMAIL`. `GMAIL_SENDER_NAME` and `RECEIVER_NAME` are optional
+display names; the recipient can use any email provider.
+
+The sender connects to `smtp.gmail.com:587` with STARTTLS. If the three required
+email settings are empty/incomplete, email is disabled. Delivery failures are
+logged separately and never trigger another booking. Notifications distinguish
+`[TEST]` slots from verified bookings; an unverified POST produces a message asking
+you to check the account.
 
 Note `detect_and_notify.py` is no longer maintained.
+
+### Offline checks
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+Tests use synthetic portal responses and mocked HTTP/SMTP transports. They cover
+test-mode POST suppression, hidden/applicant fields, expired authentication,
+false success responses, ambiguous POST timeouts, exclusions, browser cleanup and
+optional email. The current portal's account-specific HTML must still be checked
+on a real account; unknown confirmation markup is treated as unverified.
 
 ## Caution
 
@@ -90,7 +146,8 @@ Consulates other than Toronto and Vancouver are not tested.
 
 Please feel free to report issues. PRs are welcomed and greatly appreciated!
 
-One improvement I'm interested in is rewriting `legacy_rescheduler` using `requests`.
+The main script uses `AppointmentClient` for HTTP booking. `legacy_rescheduler.py`
+is retained as the historical browser implementation and is not called by it.
 
 ## Special thanks
 

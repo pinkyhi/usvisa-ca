@@ -7,17 +7,17 @@ class RequestTracker:
         self.retries = 0
         self.max_retries = max_retries
         self.max_time = max_time
-        self.start_time = time.time()
+        self.start_time = time.monotonic()
 
     def retry(self):
         self.retries += 1
 
     def should_retry(self):
-        if self.retries > self.max_retries:
+        if self.retries >= self.max_retries:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Max retries reached")
             return False
-        elapsed_time = time.time() - self.start_time
-        if elapsed_time > self.max_time:
+        elapsed_time = time.monotonic() - self.start_time
+        if elapsed_time >= self.max_time:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Max time reached")
             return False
         return True

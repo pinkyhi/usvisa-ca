@@ -1,3 +1,5 @@
+"""Historical Selenium booking; reschedule.py now uses AppointmentClient."""
+
 from time import sleep
 from datetime import datetime, date
 
