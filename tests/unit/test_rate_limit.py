@@ -46,30 +46,31 @@ class RateLimitTests(unittest.TestCase):
     def test_polling_doubles_and_resets_after_success(self):
         client = Mock()
         client.get_available_dates.side_effect = [
-            RateLimited(), RateLimited(), RateLimited("1000"), [], RateLimited(), [],
+            RateLimited(), RateLimited(), RateLimited("1000"), [], RateLimited(), [], KeyboardInterrupt(),
         ]
         with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
-                DATE_REQUEST_MAX_RETRY=5,
-                DATE_REQUEST_MAX_TIME=9000, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
+                RUN_ONCE=False, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "sleep") as sleep, \
              patch.object(reschedule, "log_message"):
-            reschedule.reschedule(client)
+            with self.assertRaises(KeyboardInterrupt):
+                reschedule.reschedule(client)
         self.assertEqual([call.args[0] for call in sleep.call_args_list],
                          [4, 8, 1000, 180, 4, 180])
         client.book.assert_not_called()
 
     def test_time_endpoint_throttling_also_doubles_without_booking_retry(self):
         client = Mock()
-        client.get_available_dates.return_value = [date(2026, 11, 12)]
+        client.get_available_dates.side_effect = [[date(2026, 11, 12)]] * 3 + [KeyboardInterrupt()]
         client.book.side_effect = [RateLimited(), RateLimited(), None]
         with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
-                DATE_REQUEST_MAX_RETRY=2, DATE_REQUEST_MAX_TIME=9000,
+                RUN_ONCE=False,
                 EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "sleep") as sleep, \
              patch.object(reschedule, "log_message"):
-            reschedule.reschedule(client)
+            with self.assertRaises(KeyboardInterrupt):
+                reschedule.reschedule(client)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [4, 8, 180])
 
     def test_backoff_survives_session_boundaries(self):
@@ -89,13 +90,12 @@ class RateLimitTests(unittest.TestCase):
             self.assertEqual(reschedule.main(), 0)
         self.assertEqual(delays, [4, 8])
 
-    def test_exhausted_backoff_notifies_and_stops_despite_polling_limits(self):
+    def test_exhausted_backoff_notifies_and_stops(self):
         client = Mock()
         client.get_available_dates.side_effect = RateLimited()
-        with patch.multiple(reschedule, DATE_REQUEST_MAX_RETRY=1,
-                DATE_REQUEST_MAX_TIME=1, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
+        with patch.multiple(reschedule, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[],
-                RUN_ONCE=True), \
+                RUN_ONCE=False), \
              patch.object(reschedule, "validate_settings"), \
              patch.object(reschedule, "log_message"), \
              patch.object(reschedule, "sleep") as sleep, \
@@ -121,3 +121,19 @@ class RateLimitTests(unittest.TestCase):
                 self.assertEqual(reschedule.main(), 1 if run_once else 0)
                 self.assertEqual(run.call_count, 1 if run_once else 2)
                 sleep.assert_not_called()
+
+    def test_run_once_does_not_retry_or_wait_on_429(self):
+        client = Mock()
+        client.get_available_dates.side_effect = RateLimited("600")
+        with patch.multiple(reschedule, RUN_ONCE=True,
+                EARLIEST_ACCEPTABLE_DATE="2026-11-01",
+                LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
+             patch.object(reschedule, "validate_settings"), \
+             patch.object(reschedule, "log_message"), \
+             patch.object(reschedule, "sleep") as sleep, \
+             patch.object(reschedule, "reschedule_with_new_session") as run:
+            run.side_effect = lambda *, backoff: reschedule.reschedule(client, backoff=backoff)
+            self.assertEqual(reschedule.main(), 1)
+        run.assert_called_once()
+        client.get_available_dates.assert_called_once()
+        sleep.assert_not_called()

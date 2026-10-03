@@ -59,13 +59,10 @@ PERSIST_SESSION = env_bool("PERSIST_SESSION", True)
 SESSION_CACHE_DIR = Path(__file__).with_name(".sessions")
 DETACH = env_bool("DETACH", False)
 NEW_SESSION_AFTER_FAILURES = int(os.getenv("NEW_SESSION_AFTER_FAILURES", "5"))
-NEW_SESSION_DELAY = int(os.getenv("NEW_SESSION_DELAY", "300"))
 TIMEOUT = int(os.getenv("TIMEOUT", "10"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 FAIL_RETRY_DELAY = int(os.getenv("FAIL_RETRY_DELAY", "180"))
-DATE_REQUEST_DELAY = int(os.getenv("DATE_REQUEST_DELAY", "180"))
-DATE_REQUEST_MAX_RETRY = int(os.getenv("DATE_REQUEST_MAX_RETRY", "5"))
-DATE_REQUEST_MAX_TIME = int(os.getenv("DATE_REQUEST_MAX_TIME", str(15 * 60)))
+DATE_REQUEST_DELAY = int(os.getenv("DATE_REQUEST_DELAY", "240"))
 
 LOGIN_URL = "https://ais.usvisa-info.com/en-ca/niv/users/sign_in"
 APPOINTMENT_PAGE_URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/{id}/appointment"
@@ -98,9 +95,9 @@ def validate_settings():
     if any(start > end for start, end in exclusions):
         raise ValueError("Exclusion start dates must not be after their end dates")
     for name in ("NUM_PARTICIPANTS", "NEW_SESSION_AFTER_FAILURES", "TIMEOUT",
-                 "HTTP_TIMEOUT", "DATE_REQUEST_MAX_RETRY", "DATE_REQUEST_MAX_TIME"):
+                 "HTTP_TIMEOUT"):
         if globals()[name] <= 0:
             raise ValueError(f"{name} must be positive")
-    for name in ("NEW_SESSION_DELAY", "FAIL_RETRY_DELAY", "DATE_REQUEST_DELAY"):
+    for name in ("FAIL_RETRY_DELAY", "DATE_REQUEST_DELAY"):
         if globals()[name] < 0:
             raise ValueError(f"{name} must not be negative")

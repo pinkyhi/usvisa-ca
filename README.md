@@ -57,7 +57,7 @@ USER_PASSWORD=""    # The password for your  https://ais.usvisa-info.com/en-ca/n
 NUM_PARTICIPANTS=1
 TEST_MODE=true          # false enables real booking
 SHOW_GUI=true          # show Chrome during login
-RUN_ONCE=true          # stop after one session
+RUN_ONCE=true          # perform one availability check and exit
 PERSIST_SESSION=true   # reuse login cookies between runs
 EARLIEST_ACCEPTABLE_DATE="" # The earliest interview date you are looking for
 LATEST_ACCEPTABLE_DATE=""   # The latest acceptable interview date
@@ -89,20 +89,21 @@ An unverified booking stops the script for manual checking.
 Configure polling in `.env` (delays are in seconds):
 
 ```dotenv
-DATE_REQUEST_DELAY=180       # Pause between availability checks
-DATE_REQUEST_MAX_RETRY=5     # Maximum checks per ordinary polling cycle
-NEW_SESSION_DELAY=300       # Pause between cycles with RUN_ONCE=false
+DATE_REQUEST_DELAY=240       # Seconds between availability checks
 ```
 
-Restart the script after changing these values. The cycle also has a time limit
-of `DATE_REQUEST_MAX_TIME=900` seconds by default.
+With `RUN_ONCE=false`, checks continue on the same authenticated HTTP session
+until a suitable slot is found or the program is stopped. There are no polling
+cycles, request-count limits or pauses between cycles. `RUN_ONCE=true` performs
+one availability check, with no delay or retry, including on HTTP 429. A suitable
+date can trigger further requests for times, the booking form and verification.
+Restart the script after changing `.env`.
 
 HTTP 429 responses trigger cooldowns of 4, 8, 16, 32, 64, 128, 256, 512, 1024,
 2048 and 4096 seconds. A further 429 sends a Gmail notification and stops the
 program with exit code 1. `Retry-After` seconds or HTTP dates can extend a cooldown.
-Backoff persists across session cycles and resets after an availability cycle
-without throttling. An active backoff sequence continues beyond ordinary polling
-retry/time limits. Empty HTTP 200 availability alone cannot distinguish no slots
+Backoff persists across reauthentication and resets after an availability check
+without throttling. Empty HTTP 200 availability alone cannot distinguish no slots
 from hidden throttling. Booking POSTs are never automatically retried.
 Expired authentication restarts Selenium login with `RUN_ONCE=false`; with
 `RUN_ONCE=true`, an expired session ends the run instead.

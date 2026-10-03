@@ -14,7 +14,6 @@ from appointment_client import (
     acceptable_dates,
 )
 from notifications import send_notification
-from request_tracker import RequestTracker
 from session_cache import SessionCache
 from settings import *
 
@@ -160,9 +159,7 @@ def get_appointment_page(driver: WebDriver) -> None:
     driver.get(appointment_url)
 
 
-def get_available_dates(client: AppointmentClient, request_tracker: RequestTracker):
-    request_tracker.log_retry()
-    request_tracker.retry()
+def get_available_dates(client: AppointmentClient):
     try:
         return client.get_available_dates()
     except (AuthenticationExpired, RateLimited):
@@ -183,10 +180,6 @@ class RateLimitBackoff:
     def reset(self):
         self.delay = 4
 
-    @property
-    def active(self):
-        return self.delay > 4
-
     def wait(self, error):
         if self.delay > 4096:
             raise RateLimitExhausted(
@@ -198,29 +191,30 @@ class RateLimitBackoff:
         sleep(delay)
 
 
-def reschedule(client: AppointmentClient, retryCount: int = 0, backoff=None):
+def reschedule(client: AppointmentClient, backoff=None):
     backoff = backoff if backoff is not None else RateLimitBackoff()
-    date_request_tracker = RequestTracker(
-        retryCount if retryCount > 0 else DATE_REQUEST_MAX_RETRY,
-        DATE_REQUEST_MAX_TIME,
-    )
     earliest = date.fromisoformat(EARLIEST_ACCEPTABLE_DATE)
     latest = date.fromisoformat(LATEST_ACCEPTABLE_DATE)
     exclusions = [(date.fromisoformat(start), date.fromisoformat(end))
                   for start, end in EXCLUSION_DATE_RANGES]
-    # Finish an ongoing backoff sequence even if ordinary polling limits expire.
-    while backoff.active or date_request_tracker.should_retry():
+    while True:
         try:
-            dates = get_available_dates(client, date_request_tracker)
+            dates = get_available_dates(client)
         except RateLimited as error:
+            if RUN_ONCE:
+                raise
             backoff.wait(error)
             continue
         if dates is None:
+            if RUN_ONCE:
+                return None
             sleep(DATE_REQUEST_DELAY)
             continue
         if not dates:
             backoff.reset()
             log_message("Portal returned HTTP 200 with no available dates; rate limiting cannot be determined from an empty list alone")
+            if RUN_ONCE:
+                return None
             sleep(DATE_REQUEST_DELAY)
             continue
         candidates = acceptable_dates(dates, earliest, latest, exclusions)
@@ -232,6 +226,8 @@ def reschedule(client: AppointmentClient, retryCount: int = 0, backoff=None):
             try:
                 result = client.book(day, dry_run=TEST_MODE)
             except RateLimited as error:
+                if RUN_ONCE:
+                    raise
                 backoff.wait(error)
                 rate_limited = True
                 break
@@ -267,8 +263,9 @@ def reschedule(client: AppointmentClient, retryCount: int = 0, backoff=None):
         if rate_limited:
             continue
         backoff.reset()
+        if RUN_ONCE:
+            return None
         sleep(DATE_REQUEST_DELAY)
-    return None
 
 
 def close_driver(driver):
@@ -278,15 +275,15 @@ def close_driver(driver):
         log_message(f"Browser cleanup failed ({type(error).__name__})")
 
 
-def run_http_session(client, retryCount, cache=None, validate_session=False, backoff=None):
+def run_http_session(client, cache=None, validate_session=False, backoff=None):
     session_valid = True
     try:
         if validate_session:
             client.check_session()
             log_message("Saved login session is valid; Selenium login was skipped")
         if backoff is None:
-            return reschedule(client, retryCount)
-        return reschedule(client, retryCount, backoff)
+            return reschedule(client)
+        return reschedule(client, backoff=backoff)
     except AuthenticationExpired:
         session_valid = False
         if cache is not None:
@@ -298,14 +295,14 @@ def run_http_session(client, retryCount, cache=None, validate_session=False, bac
             cache.save(client)
 
 
-def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY, backoff=None):
+def reschedule_with_new_session(backoff=None):
     cache = SessionCache(SESSION_CACHE_DIR, USER_EMAIL) if PERSIST_SESSION else None
     if cache is not None:
         client = cache.load(CONSULATES[USER_CONSULATE], USER_CONSULATE, HTTP_TIMEOUT)
         if client is not None:
             try:
                 with client:
-                    return run_http_session(client, retryCount, cache, validate_session=True, backoff=backoff)
+                    return run_http_session(client, cache, validate_session=True, backoff=backoff)
             except AuthenticationExpired:
                 if RUN_ONCE:
                     raise
@@ -331,7 +328,7 @@ def reschedule_with_new_session(retryCount: int = DATE_REQUEST_MAX_RETRY, backof
             close_driver(driver)
             driver = None
             log_message("Selenium login completed; availability and booking now use requests")
-            return run_http_session(client, retryCount, cache, backoff=backoff)
+            return run_http_session(client, cache, backoff=backoff)
     finally:
         if driver is not None:
             close_driver(driver)
@@ -348,21 +345,21 @@ def main():
     log_message(f"TEST_MODE={TEST_MODE}; RUN_ONCE={RUN_ONCE}")
     gmail_enabled = all((GMAIL_EMAIL, GMAIL_APPLICATION_PWD, RECEIVER_EMAIL))
     log_message(f"Gmail notifications: {'enabled' if gmail_enabled else 'disabled'}")
-    session_count = 0
     backoff = RateLimitBackoff()
     try:
         while True:
-            session_count += 1
-            log_message(f"Attempting with new session #{session_count}")
+            log_message("Preparing authenticated session")
             session_failed = False
             try:
                 result = reschedule_with_new_session(backoff=backoff)
             except RateLimitExhausted:
                 raise
             except RateLimited as error:
+                if RUN_ONCE:
+                    log_message(str(error))
+                    return 1
                 backoff.wait(error)
-                session_failed = True
-                result = None
+                continue
             except BookingNotVerified as error:
                 log_message(str(error))
                 send_notification("Visa booking needs manual verification", str(error))
@@ -380,9 +377,9 @@ def main():
             if result is not None:
                 return 0
             if RUN_ONCE:
-                log_message("Single session finished without a suitable slot")
+                log_message("Single availability check finished without a suitable slot")
                 return 1 if session_failed else 0
-            sleep(NEW_SESSION_DELAY)
+            sleep(DATE_REQUEST_DELAY)
     except RateLimitExhausted as error:
         log_message(str(error))
         delivered = send_notification("Visa rescheduler stopped: rate limit", str(error))

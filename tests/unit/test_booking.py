@@ -266,8 +266,8 @@ class RunnerTests(NoNetworkTest):
         configuration = {
             "EARLIEST_ACCEPTABLE_DATE": "2026-11-12", "LATEST_ACCEPTABLE_DATE": "2026-12-20",
             "EXCLUSION_DATE_RANGES": [], "USER_CONSULATE": "Vancouver", "TEST_MODE": True,
-            "DATE_REQUEST_DELAY": 0, "DATE_REQUEST_MAX_TIME": 900,
-            "DATE_REQUEST_MAX_RETRY": 1, "RUN_ONCE": True, "FAIL_RETRY_DELAY": 0,
+            "DATE_REQUEST_DELAY": 0,
+            "RUN_ONCE": True, "FAIL_RETRY_DELAY": 0,
             "NEW_SESSION_AFTER_FAILURES": 1,
             "PERSIST_SESSION": False,
         }
@@ -277,6 +277,28 @@ class RunnerTests(NoNetworkTest):
         output = redirect_stdout(io.StringIO())
         output.__enter__()
         self.addCleanup(output.__exit__, None, None, None)
+
+    def test_run_once_checks_dates_once_without_waiting(self):
+        for dates in ([], [date(2027, 1, 1)]):
+            with self.subTest(dates=dates):
+                client = Mock()
+                client.get_available_dates.return_value = dates
+                with patch.object(reschedule, "sleep") as sleep:
+                    self.assertIsNone(reschedule.reschedule(client))
+                client.get_available_dates.assert_called_once()
+                client.book.assert_not_called()
+                sleep.assert_not_called()
+
+    def test_continuous_polling_uses_same_client_every_240_seconds(self):
+        client = Mock()
+        client.get_available_dates.side_effect = [[]] * 7 + [[DAY]]
+        client.book.return_value = BookingResult(DAY, "08:30", True)
+        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=240), \
+             patch.object(reschedule, "sleep") as sleep, \
+             patch.object(reschedule, "send_notification"):
+            self.assertIsNotNone(reschedule.reschedule(client))
+        self.assertEqual(client.get_available_dates.call_count, 8)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [240] * 7)
 
     def test_polling_skips_date_without_times_and_does_not_claim_dry_run_success(self):
         client = Mock()
@@ -303,7 +325,7 @@ class RunnerTests(NoNetworkTest):
         client = context.__enter__.return_value
         result = BookingResult(DAY, "08:30", True)
 
-        def poll(current_client, retries):
+        def poll(current_client):
             driver.quit.assert_called_once()
             self.assertIs(current_client, client)
             return result
