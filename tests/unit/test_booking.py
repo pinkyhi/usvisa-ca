@@ -3,6 +3,8 @@
 import io
 import json
 import unittest
+from pathlib import Path
+import audit
 from contextlib import redirect_stdout
 from datetime import date
 from unittest.mock import MagicMock, Mock, patch
@@ -18,14 +20,15 @@ from appointment_client import (
     AppointmentClient, AuthenticationExpired, BookingNotVerified, BookingResult,
     PortalError, RateLimited, acceptable_dates, appointment_matches, form_fields,
 )
-from request_tracker import RequestTracker
+from legacy.request_tracker import RequestTracker
+from tests.unit.log_helpers import IsolatedLogsTest
 
 
 URL = "https://ais.usvisa-info.com/en-ca/niv/schedule/123/appointment"
 DAY = date(2026, 11, 12)
 FORM = f"""
 <form id="appointment-form" method="post" action="{URL}">
-  <input name="utf8" value="✓">
+  <input name="utf8" value="Ã¢Å“â€œ">
   <input type="hidden" name="authenticity_token" value="fresh-token">
   <input name="confirmed_limit_message" value="0">
   <input name="appointments[applicant_ids][]" value="101">
@@ -59,8 +62,9 @@ def response(html="", payload=None, url=URL, status=200):
     return result
 
 
-class NoNetworkTest(unittest.TestCase):
+class NoNetworkTest(IsolatedLogsTest):
     def setUp(self):
+        super().setUp()
         blocker = patch("requests.sessions.Session.request", side_effect=AssertionError("Unexpected live HTTP"))
         blocker.start()
         self.addCleanup(blocker.stop)
@@ -80,6 +84,26 @@ class BookingTests(NoNetworkTest):
             response(saved, url=URL + "/instructions"), response("<html></html>"),
         ]
         self.session.post.return_value = response("Successfully Scheduled")
+
+    def test_second_client_cannot_submit_after_verified_booking(self):
+        self.prepare()
+        self.client.book(DAY, dry_run=False)
+        second = AppointmentClient(self.session, URL, 95, "Vancouver")
+        self.prepare()
+        with self.assertRaises(BookingNotVerified):
+            second.book(DAY, dry_run=False)
+        self.session.post.assert_called_once()
+
+    def test_timeout_retains_guard_and_records_verification(self):
+        self.prepare(saved=OLD)
+        self.session.post.side_effect = requests.Timeout()
+        with self.assertRaises(BookingNotVerified):
+            self.client.book(DAY, dry_run=False)
+        self.assertTrue((audit.GUARD_DIR / "123.json").exists())
+        events = [json.loads(line) for line in audit.LOG_PATH.read_text().splitlines()]
+        self.assertEqual([item["outcome"] for item in events if item["event"] == "booking_post_outcome"], ["Timeout"])
+        self.assertFalse(events[-1]["verified"])
+        self.assertNotIn("fresh-token", audit.LOG_PATH.read_text())
 
     def test_dry_run_queries_form_and_times_without_booking_post(self):
         self.prepare()
@@ -422,7 +446,7 @@ class TrackerAndSettingsTests(NoNetworkTest):
             self.assertFalse(tracker.should_retry())
 
     def test_retry_time_limit_uses_monotonic_clock(self):
-        with patch("request_tracker.time.monotonic", side_effect=[100, 110]), redirect_stdout(io.StringIO()):
+        with patch("legacy.request_tracker.time.monotonic", side_effect=[100, 110]), redirect_stdout(io.StringIO()):
             self.assertFalse(RequestTracker(2, 10).should_retry())
 
     def test_test_mode_boolean_default_is_safe_and_explicit_false_works(self):

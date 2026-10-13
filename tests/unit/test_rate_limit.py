@@ -1,6 +1,6 @@
 """Offline checks for portal throttling and retry pacing."""
 
-import unittest
+from tests.unit.log_helpers import IsolatedLogsTest
 from datetime import date, datetime, timedelta, timezone
 from email.utils import format_datetime
 from unittest.mock import Mock, patch
@@ -10,8 +10,9 @@ import reschedule
 from appointment_client import AppointmentClient, AuthenticationExpired, RateLimited
 
 
-class RateLimitTests(unittest.TestCase):
+class RateLimitTests(IsolatedLogsTest):
     def setUp(self):
+        super().setUp()
         patcher = patch.multiple(reschedule, DATE_REQUEST_CYCLE_LENGTH=0,
             RATE_LIMIT_BACKOFF_INITIAL_DELAY=4, RATE_LIMIT_BACKOFF_MAX_DELAY=4096,
             RATE_LIMIT_BACKOFF_MULTIPLIER=2, EMPTY_DATES_BACKOFF_INITIAL_DELAY=240,

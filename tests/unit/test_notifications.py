@@ -3,7 +3,7 @@
 import io
 import smtplib
 import socket
-import unittest
+from tests.unit.log_helpers import IsolatedLogsTest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
@@ -12,8 +12,9 @@ import settings
 from tests.gmail_check import check_gmail
 
 
-class GmailCheckTests(unittest.TestCase):
+class GmailCheckTests(IsolatedLogsTest):
     def setUp(self):
+        super().setUp()
         self.real_smtp = smtplib.SMTP
         patcher = patch.multiple(
             settings, GMAIL_EMAIL="sender@gmail.com", GMAIL_APPLICATION_PWD="abcd efgh ijkl mnop",

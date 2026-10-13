@@ -1,5 +1,6 @@
 from datetime import date, datetime
 import json
+import audit
 from pathlib import Path
 from time import sleep
 
@@ -23,6 +24,7 @@ AVAILABLE_DATES_LOG_PATH = Path(__file__).resolve().parent / "logs" / "available
 
 
 def log_message(message: str) -> None:
+    audit.event("message", message=message)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] {message}")
 
@@ -196,6 +198,7 @@ def reschedule(client: AppointmentClient, backoff=None):
             wait_for_next_check("empty")
             continue
         candidates = acceptable_dates(dates, earliest, latest, exclusions)
+        audit.event("availability_filtered", available=dates, candidates=candidates, earliest=earliest, latest=latest, exclusions=exclusions)
         if not candidates:
             log_message(f"No dates match the configured range/exclusions; earliest available: {dates[0]}")
         rate_limited = False
@@ -320,7 +323,7 @@ def reschedule_with_new_session(backoff=None):
             close_driver(driver)
 
 
-def main():
+def _main():
     try:
         validate_settings()
     except ValueError as error:
@@ -375,6 +378,19 @@ def main():
     except KeyboardInterrupt:
         log_message("Stopped by user")
         return 0
+
+
+def main():
+    audit.event("run_started", test_mode=TEST_MODE, run_once=RUN_ONCE,
+                consulate=USER_CONSULATE, earliest=EARLIEST_ACCEPTABLE_DATE,
+                latest=LATEST_ACCEPTABLE_DATE)
+    try:
+        code = _main()
+    except Exception as error:
+        audit.event("run_failed", error_type=type(error).__name__)
+        raise
+    audit.event("run_finished", exit_code=code)
+    return code
 
 
 if __name__ == "__main__":

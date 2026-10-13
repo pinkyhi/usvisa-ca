@@ -172,7 +172,7 @@ Consulates other than Toronto and Vancouver are not tested.
 
 Please feel free to report issues. PRs are welcomed and greatly appreciated!
 
-Booking now uses `AppointmentClient`; `legacy_rescheduler.py` is kept for reference.
+Booking now uses `AppointmentClient`; `legacy/legacy_rescheduler.py` is kept for reference.
 
 ## Special thanks
 
@@ -185,3 +185,28 @@ Thanks to [@trungnguyen21](https://github.com/trungnguyen21) and [@saroopskesav]
 ## Disclaimer
 
 This script is provided as-is for the purpose of assisting individuals in rescheduling appointments. While it has been developed with care and with the intention of being helpful, it comes with no guarantees or warranties of any kind, either expressed or implied. By using this script, you acknowledge and agree that you are doing so at your own risk. The author(s) or contributor(s) of this script shall not be held liable for any direct or indirect damages that arise from its use. Please ensure that you understand the actions performed by this script before running it, and consider the ethical and legal implications of its use in your context.
+
+### One submission per application and audit trail
+
+Before a real appointment POST, the client exclusively creates and flushes
+`.booking-state/<application-id>.json`. This blocks a second submission from
+another client/process or after restart using this checkout. The marker remains
+after success, rejection, timeout, failed verification or interruption. This is
+an **at-most-once submission** guarantee, not a guarantee that the portal will
+save a booking. Dry runs never create the marker. Keep this directory when
+restarting or moving the installation; independent copies/machines do not share
+its protection. Only consider removing a marker after manually checking the
+portal and deliberately deciding to permit another submission.
+
+`logs/rescheduler.jsonl` contains UTC timestamps, run IDs and process IDs,
+HTTP GET endpoint/status/duration/error type, consent submission events,
+availability and filtering, prepared slot and applicant count, booking POST
+outcome/duration, verification page matches, notifications, and run exit status.
+Cookies, passwords, CSRF tokens, applicant IDs, and portal response bodies are
+not recorded. Audit writes are flushed to disk; a write failure stops execution.
+The submission marker is kept independently of the audit log.
+
+The flow is: restore session or sign in ? discover application and prepare form
+? fetch and filter dates ? fetch fresh form and available times ? choose earliest
+time ? dry-run exit, or persist guard and submit once ? verify the saved date,
+time and consulate ? notify and exit. Unknown outcomes require manual checking.

@@ -1,6 +1,7 @@
 """Optional Gmail notifications; a mail failure never changes a booking result."""
 
 import logging
+import audit
 import smtplib
 import ssl
 from email.message import EmailMessage
@@ -13,6 +14,7 @@ def send_notification(subject, text, *, raise_on_error=False):
     if not all((settings.GMAIL_EMAIL, settings.GMAIL_APPLICATION_PWD, settings.RECEIVER_EMAIL)):
         if raise_on_error:
             raise ValueError("Configure GMAIL_EMAIL, GMAIL_APPLICATION_PWD and RECEIVER_EMAIL in .env")
+        audit.event("notification_skipped", reason="unconfigured")
         return False
     stage = "building the message"
     try:
@@ -40,6 +42,7 @@ def send_notification(subject, text, *, raise_on_error=False):
             smtp.send_message(message)
             stage = "closing the SMTP session after submission"
     except (smtplib.SMTPException, OSError, ValueError) as error:
+        audit.event("notification_failed", stage=stage, error_type=type(error).__name__)
         error.notification_stage = stage
         if raise_on_error:
             raise
@@ -48,4 +51,5 @@ def send_notification(subject, text, *, raise_on_error=False):
             stage, type(error).__name__,
         )
         return False
+    audit.event("notification_delivered")
     return True

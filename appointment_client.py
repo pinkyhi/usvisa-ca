@@ -1,6 +1,8 @@
 """HTTP availability and booking using a session authenticated by Selenium."""
 
 import re
+import time as clock
+import audit
 from dataclasses import dataclass
 from datetime import date, time, datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -251,11 +253,13 @@ class AppointmentClient:
                     fields = replace_fields(fields, {checkbox["name"]: checkbox.get("value", "1")})
             if not dict(fields).get("authenticity_token"):
                 raise PortalError("Consent form has no CSRF token")
+            audit.event("consent_post_started")
             try:
                 response = self.session.post(target, data=fields, timeout=self.timeout,
                                              headers={"Referer": response.url})
             except requests.RequestException as error:
                 raise PortalError(f"Consent request failed ({type(error).__name__})") from error
+            audit.event("consent_post_completed", status=response.status_code)
             self._check_response(response)
             # Fetch the actual appointment page after completing consent.
             response = self._get(self.appointment_url)
@@ -268,10 +272,15 @@ class AppointmentClient:
         self.session.close()
 
     def _get(self, url, **kwargs):
+        endpoint = re.sub(r"/schedule/\d+", "/schedule/<application>", urlsplit(url).path)
+        started = clock.monotonic()
+        audit.event("http_started", method="GET", endpoint=endpoint)
         try:
             response = self.session.get(url, timeout=self.timeout, **kwargs)
         except requests.RequestException as error:
+            audit.event("http_failed", method="GET", endpoint=endpoint, error_type=type(error).__name__, elapsed_ms=round((clock.monotonic()-started)*1000))
             raise PortalError(f"Portal GET failed ({type(error).__name__})") from error
+        audit.event("http_completed", method="GET", endpoint=endpoint, status=response.status_code, elapsed_ms=round((clock.monotonic()-started)*1000))
         self._check_response(response)
         return response
 
@@ -438,7 +447,9 @@ class AppointmentClient:
                 continue
             if not account_page and urlsplit(response.url).path.rstrip("/") != urlsplit(url).path:
                 account_page = True
-            if self._saved_appointment_matches(response.text, day, slot_time, account_page):
+            matches = self._saved_appointment_matches(response.text, day, slot_time, account_page)
+            audit.event("verification_page", source="account" if account_page else "instructions", matches=matches)
+            if matches:
                 return True
         return False
 
@@ -459,8 +470,20 @@ class AppointmentClient:
             values["confirmed_limit_message"] = "1"
         fields = replace_fields(fields, values)
         result = BookingResult(day, slot_time, dry_run)
+        audit.event("booking_prepared", date=day, time=slot_time, consulate=self.consulate,
+                    dry_run=dry_run, applicant_count=sum(name == "appointments[applicant_ids][]" for name, _ in fields))
         if dry_run:
+            audit.event("booking_dry_run", booking_post_sent=False)
             return result
+        try:
+            audit.claim(self.schedule_id, day, slot_time, self.consulate)
+        except FileExistsError as error:
+            audit.event("booking_blocked", reason="persistent_submission_guard")
+            raise BookingNotVerified("A booking submission was already reserved for this application. Check the portal and .booking-state before any further booking; no POST was sent.") from error
+        except OSError as error:
+            raise BookingNotVerified("Could not persist booking guard; no POST was sent.") from error
+        audit.event("booking_post_started", date=day, time=slot_time, consulate=self.consulate)
+        started = clock.monotonic()
         origin = urlsplit(self.appointment_url)
         try:
             response = self.session.post(
@@ -473,7 +496,13 @@ class AppointmentClient:
         except requests.RequestException as error:
             # A timeout does not prove the server failed to save the booking.
             outcome = type(error).__name__
-        if self.verify_booking(day, slot_time):
+        audit.event("booking_post_outcome", outcome=outcome, elapsed_ms=round((clock.monotonic()-started)*1000))
+        try:
+            verified = self.verify_booking(day, slot_time)
+        except Exception as error:
+            raise BookingNotVerified("Booking verification failed after submission; guard retained. Check the portal manually.") from error
+        audit.event("booking_verification", verified=verified, date=day, time=slot_time, consulate=self.consulate)
+        if verified:
             return result
         raise BookingNotVerified(
             f"Booking POST completed with {outcome}, but {day} at {slot_time} "

@@ -168,3 +168,5 @@ local.py
 # Logs
 logs/
 *.log
+
+.booking-state/
