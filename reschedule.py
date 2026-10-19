@@ -172,7 +172,7 @@ def reschedule(client: AppointmentClient, backoff=None):
             continue
         if not dates:
             backoff.reset()
-            log_message("Portal returned HTTP 200 with no available dates; rate limiting cannot be determined from an empty list alone")
+            log_message("Portal returned HTTP 200 with no available dates")
             if RUN_ONCE:
                 return None
             wait_for_next_check()

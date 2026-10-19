@@ -119,8 +119,7 @@ HTTP 429 responses trigger cooldowns of 4, 8, 16, 32, 64, 128, 256, 512, 1024,
 2048 and 4096 seconds. A further 429 sends a Gmail notification and stops the
 program with exit code 1. `Retry-After` seconds or HTTP dates can extend a cooldown.
 Backoff persists across reauthentication and resets after an availability check
-without throttling. Empty HTTP 200 availability alone cannot distinguish no slots
-from hidden throttling. Booking POSTs are never automatically retried.
+without throttling. Booking POSTs are never automatically retried.
 Empty dates use the ordinary polling delay and cycle gap, without exponential
 backoff or reauthentication. The HTTP 429 backoff restarts when the program
 restarts. Errors and empty responses count
