@@ -110,11 +110,6 @@ class RateLimitBackoff:
             RATE_LIMIT_BACKOFF_INITIAL_DELAY, RATE_LIMIT_BACKOFF_MAX_DELAY,
             RATE_LIMIT_BACKOFF_MULTIPLIER,
         ))
-        self.empty_enabled = all(value > 0 for value in (
-            EMPTY_DATES_BACKOFF_INITIAL_DELAY, EMPTY_DATES_BACKOFF_MAX_DELAY,
-            EMPTY_DATES_BACKOFF_MULTIPLIER,
-        ))
-        self.empty_delay = EMPTY_DATES_BACKOFF_INITIAL_DELAY
         self.reset()
 
     def reset(self):
@@ -139,18 +134,6 @@ class RateLimitBackoff:
         log_message(f"Rate limited; waiting {delay:g} seconds before another request")
         sleep(delay)
 
-    def wait_empty(self, minimum_delay=0):
-        if not self.empty_enabled:
-            if minimum_delay > 0:
-                log_message(f"Empty dates; waiting {minimum_delay:g} seconds before another request")
-                sleep(minimum_delay)
-            return
-        delay = max(self.empty_delay, minimum_delay)
-        self.empty_delay = min(self.empty_delay * EMPTY_DATES_BACKOFF_MULTIPLIER,
-                               EMPTY_DATES_BACKOFF_MAX_DELAY)
-        log_message(f"Empty dates; waiting {delay:g} seconds before another request")
-        sleep(delay)
-
 
 def reschedule(client: AppointmentClient, backoff=None):
     backoff = backoff if backoff is not None else RateLimitBackoff()
@@ -159,16 +142,13 @@ def reschedule(client: AppointmentClient, backoff=None):
     def wait_for_next_check(reason=None):
         nonlocal checks_in_cycle
         use_normal_delay = (reason is None
-                            or (reason == "empty" and not backoff.empty_enabled)
                             or (isinstance(reason, RateLimited) and not backoff.rate_limit_enabled))
         delay = DATE_REQUEST_DELAY if use_normal_delay else 0
         if DATE_REQUEST_CYCLE_LENGTH and checks_in_cycle >= DATE_REQUEST_CYCLE_LENGTH:
             checks_in_cycle = 0
             delay = DATE_REQUEST_CYCLE_GAP
             log_message(f"Date request cycle finished; next cycle in {delay} seconds")
-        if reason == "empty":
-            backoff.wait_empty(minimum_delay=delay)
-        elif reason is not None:
+        if reason is not None:
             backoff.wait(reason, minimum_delay=delay)
         else:
             sleep(delay)
@@ -195,7 +175,7 @@ def reschedule(client: AppointmentClient, backoff=None):
             log_message("Portal returned HTTP 200 with no available dates; rate limiting cannot be determined from an empty list alone")
             if RUN_ONCE:
                 return None
-            wait_for_next_check("empty")
+            wait_for_next_check()
             continue
         candidates = acceptable_dates(dates, earliest, latest, exclusions)
         audit.event("availability_filtered", available=dates, candidates=candidates, earliest=earliest, latest=latest, exclusions=exclusions)

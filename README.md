@@ -99,11 +99,6 @@ DATE_REQUEST_CYCLE_GAP=900   # Seconds between cycles
 RATE_LIMIT_BACKOFF_INITIAL_DELAY=4
 RATE_LIMIT_BACKOFF_MAX_DELAY=4096
 RATE_LIMIT_BACKOFF_MULTIPLIER=2
-
-# HTTP 200 []: seconds; hold at the maximum pause without resetting
-EMPTY_DATES_BACKOFF_INITIAL_DELAY=240
-EMPTY_DATES_BACKOFF_MAX_DELAY=3840
-EMPTY_DATES_BACKOFF_MULTIPLIER=2
 ```
 
 With `RUN_ONCE=false`, checks continue on the same authenticated HTTP session
@@ -126,16 +121,15 @@ program with exit code 1. `Retry-After` seconds or HTTP dates can extend a coold
 Backoff persists across reauthentication and resets after an availability check
 without throttling. Empty HTTP 200 availability alone cannot distinguish no slots
 from hidden throttling. Booking POSTs are never automatically retried.
-Empty dates trigger separate pauses of 240, 480, 960, 1920 and then 3840 seconds repeatedly.
-The empty-response backoff never resets during the process, even after nonempty
-replies or reauthentication. Nonempty replies still use ordinary polling delays.
-Both backoffs restart when the program restarts. Errors and empty responses count
+Empty dates use the ordinary polling delay and cycle gap, without exponential
+backoff or reauthentication. The HTTP 429 backoff restarts when the program
+restarts. Errors and empty responses count
 toward cycles; at a cycle boundary the longer applicable pause is used, without
 adding the cycle gap to backoff. `RUN_ONCE` never waits or retries.
-Each backoff is enabled only when all three of its parameters are present and
+The HTTP 429 backoff is enabled only when all three of its parameters are present and
 positive. Setting any parameter to `0`, leaving it blank or omitting it disables
-that backoff, including the stop after exhausted HTTP 429 cooldowns. Disabled
-backoffs use the ordinary polling delay and cycle gap; HTTP 429 still respects
+that backoff, including the stop after exhausted HTTP 429 cooldowns. A disabled
+backoff uses the ordinary polling delay and cycle gap; HTTP 429 still respects
 `Retry-After`. Initial and maximum delays are in seconds; multipliers are unitless.
 Expired authentication restarts Selenium login with `RUN_ONCE=false`; with
 `RUN_ONCE=true`, an expired session ends the run instead.

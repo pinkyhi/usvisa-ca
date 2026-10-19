@@ -15,8 +15,7 @@ class RateLimitTests(IsolatedLogsTest):
         super().setUp()
         patcher = patch.multiple(reschedule, DATE_REQUEST_CYCLE_LENGTH=0,
             RATE_LIMIT_BACKOFF_INITIAL_DELAY=4, RATE_LIMIT_BACKOFF_MAX_DELAY=4096,
-            RATE_LIMIT_BACKOFF_MULTIPLIER=2, EMPTY_DATES_BACKOFF_INITIAL_DELAY=240,
-            EMPTY_DATES_BACKOFF_MAX_DELAY=3840, EMPTY_DATES_BACKOFF_MULTIPLIER=2)
+            RATE_LIMIT_BACKOFF_MULTIPLIER=2)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -65,7 +64,7 @@ class RateLimitTests(IsolatedLogsTest):
             with self.assertRaises(KeyboardInterrupt):
                 reschedule.reschedule(client)
         self.assertEqual([call.args[0] for call in sleep.call_args_list],
-                         [4, 8, 1000, 240, 4, 480])
+                         [4, 8, 1000, 180, 4, 180])
         client.book.assert_not_called()
 
     def test_time_endpoint_throttling_also_doubles_without_booking_retry(self):
@@ -147,7 +146,7 @@ class RateLimitTests(IsolatedLogsTest):
         client.get_available_dates.assert_called_once()
         sleep.assert_not_called()
 
-    def test_empty_dates_cap_persists_after_nonempty_reply(self):
+    def test_empty_dates_use_normal_delay_even_after_nonempty_reply(self):
         client = Mock()
         client.get_available_dates.side_effect = ([[]] * 6
             + [[date(2027, 1, 1)], [], KeyboardInterrupt()])
@@ -158,25 +157,21 @@ class RateLimitTests(IsolatedLogsTest):
             with self.assertRaises(KeyboardInterrupt):
                 reschedule.reschedule(client)
         self.assertEqual([call.args[0] for call in sleep.call_args_list],
-                         [240, 480, 960, 1920, 3840, 3840, 180, 3840])
+                         [180] * 8)
         client.book.assert_not_called()
 
-    def test_empty_delay_survives_reauthentication(self):
-        delays = []
-        def attempt(*, backoff):
-            delays.append(backoff.empty_delay)
-            if len(delays) == 1:
-                backoff.wait_empty()
-                raise AuthenticationExpired("HTTP 401")
-            return object()
-        with patch.object(reschedule, "RUN_ONCE", False), \
-             patch.object(reschedule, "validate_settings"), \
-             patch.object(reschedule, "log_message"), \
+    def test_run_once_does_not_retry_or_wait_on_empty_dates(self):
+        client = Mock()
+        client.get_available_dates.return_value = []
+        with patch.multiple(reschedule, RUN_ONCE=True,
+                EARLIEST_ACCEPTABLE_DATE="2026-11-01",
+                LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "sleep") as sleep, \
-             patch.object(reschedule, "reschedule_with_new_session", side_effect=attempt):
-            self.assertEqual(reschedule.main(), 0)
-        self.assertEqual(delays, [240, 480])
-        sleep.assert_called_once_with(240)
+             patch.object(reschedule, "log_message"):
+            self.assertIsNone(reschedule.reschedule(client))
+        client.get_available_dates.assert_called_once()
+        client.book.assert_not_called()
+        sleep.assert_not_called()
 
     def test_custom_429_backoff_reaches_cap_then_stops(self):
         with patch.multiple(reschedule, RATE_LIMIT_BACKOFF_INITIAL_DELAY=3,
@@ -189,7 +184,7 @@ class RateLimitTests(IsolatedLogsTest):
                 backoff.wait(RateLimited())
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [3, 9, 10])
 
-    def test_empty_backoff_and_cycle_gap_use_longer_pause(self):
+    def test_empty_dates_respect_cycle_gap(self):
         client = Mock()
         client.get_available_dates.side_effect = [[], [], [], KeyboardInterrupt()]
         with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_CYCLE_LENGTH=1,
@@ -198,39 +193,30 @@ class RateLimitTests(IsolatedLogsTest):
              patch.object(reschedule, "sleep") as sleep, patch.object(reschedule, "log_message"):
             with self.assertRaises(KeyboardInterrupt):
                 reschedule.reschedule(client)
-        self.assertEqual([call.args[0] for call in sleep.call_args_list], [900, 900, 960])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [900, 900, 900])
 
-    def test_zero_parameter_disables_only_its_backoff(self):
-        for prefix in ("RATE_LIMIT_BACKOFF", "EMPTY_DATES_BACKOFF"):
-            for suffix in ("INITIAL_DELAY", "MAX_DELAY", "MULTIPLIER"):
-                with self.subTest(prefix=prefix, suffix=suffix), \
-                     patch.object(reschedule, f"{prefix}_{suffix}", 0), \
-                     patch.object(reschedule, "sleep") as sleep, \
-                     patch.object(reschedule, "log_message"):
-                    backoff = reschedule.RateLimitBackoff()
-                    self.assertEqual(backoff.rate_limit_enabled, prefix != "RATE_LIMIT_BACKOFF")
-                    self.assertEqual(backoff.empty_enabled, prefix != "EMPTY_DATES_BACKOFF")
-                    for _ in range(15):
-                        if prefix == "RATE_LIMIT_BACKOFF":
-                            backoff.wait(RateLimited())
-                        else:
-                            backoff.wait_empty()
-                    sleep.assert_not_called()
-                    if prefix == "RATE_LIMIT_BACKOFF":
-                        backoff.wait(RateLimited("600"), minimum_delay=180)
-                        sleep.assert_called_once_with(600)
-                    else:
-                        backoff.wait_empty(minimum_delay=180)
-                        sleep.assert_called_once_with(180)
+    def test_zero_parameter_disables_rate_limit_backoff(self):
+        for suffix in ("INITIAL_DELAY", "MAX_DELAY", "MULTIPLIER"):
+            with self.subTest(suffix=suffix), \
+                 patch.object(reschedule, f"RATE_LIMIT_BACKOFF_{suffix}", 0), \
+                 patch.object(reschedule, "sleep") as sleep, \
+                 patch.object(reschedule, "log_message"):
+                backoff = reschedule.RateLimitBackoff()
+                self.assertFalse(backoff.rate_limit_enabled)
+                for _ in range(15):
+                    backoff.wait(RateLimited())
+                sleep.assert_not_called()
+                backoff.wait(RateLimited("600"), minimum_delay=180)
+                sleep.assert_called_once_with(600)
 
-    def test_disabled_backoffs_use_polling_delay_and_cycle_gap(self):
+    def test_disabled_backoff_uses_polling_delay_and_cycle_gap(self):
         client = Mock()
         client.get_available_dates.side_effect = [
             RateLimited(), [], RateLimited("600"), [], KeyboardInterrupt(),
         ]
         with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=180,
                 DATE_REQUEST_CYCLE_LENGTH=2, DATE_REQUEST_CYCLE_GAP=900,
-                RATE_LIMIT_BACKOFF_INITIAL_DELAY=0, EMPTY_DATES_BACKOFF_INITIAL_DELAY=0,
+                RATE_LIMIT_BACKOFF_INITIAL_DELAY=0,
                 EARLIEST_ACCEPTABLE_DATE="2026-11-01", LATEST_ACCEPTABLE_DATE="2026-12-01",
                 EXCLUSION_DATE_RANGES=[]), patch.object(reschedule, "sleep") as sleep, \
                 patch.object(reschedule, "log_message"):

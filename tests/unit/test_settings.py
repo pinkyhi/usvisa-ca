@@ -21,12 +21,12 @@ class BackoffSettingsTests(unittest.TestCase):
     def test_missing_parameters_default_to_zero(self):
         settings = self.load_settings({})
         settings["validate_settings"]()
-        for prefix in ("RATE_LIMIT_BACKOFF", "EMPTY_DATES_BACKOFF"):
+        for prefix in ("RATE_LIMIT_BACKOFF",):
             for suffix in ("INITIAL_DELAY", "MAX_DELAY", "MULTIPLIER"):
                 self.assertEqual(settings[f"{prefix}_{suffix}"], 0)
 
     def test_zero_blank_or_missing_parameter_disables_validation_of_enabled_limits(self):
-        for prefix in ("RATE_LIMIT_BACKOFF", "EMPTY_DATES_BACKOFF"):
+        for prefix in ("RATE_LIMIT_BACKOFF",):
             for suffix in ("INITIAL_DELAY", "MAX_DELAY", "MULTIPLIER"):
                 for value in (None, "", "0"):
                     with self.subTest(prefix=prefix, suffix=suffix, value=value):
@@ -43,7 +43,7 @@ class BackoffSettingsTests(unittest.TestCase):
                         settings["validate_settings"]()
 
     def test_invalid_enabled_backoff_or_negative_parameter_is_rejected(self):
-        for prefix in ("RATE_LIMIT_BACKOFF", "EMPTY_DATES_BACKOFF"):
+        for prefix in ("RATE_LIMIT_BACKOFF",):
             for initial, maximum, multiplier in ((240, 10, 2), (4, 4096, 1), (-1, 0, 0)):
                 with self.subTest(prefix=prefix, values=(initial, maximum, multiplier)):
                     settings = self.load_settings({f"{prefix}_INITIAL_DELAY": str(initial),
