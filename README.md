@@ -126,7 +126,8 @@ Empty dates use the ordinary polling delay and cycle gap, without exponential
 backoff or reauthentication. The HTTP 429 backoff restarts when the program
 restarts. Errors and empty responses count
 toward cycles; at a cycle boundary the longer applicable pause is used, without
-adding the cycle gap to backoff. `RUN_ONCE` never waits or retries.
+adding the cycle gap to backoff. In solo mode, `RUN_ONCE` never waits or retries;
+in coordinated mode it waits for its first assigned phase before the single check.
 The HTTP 429 backoff is enabled only when all three of its parameters are present and
 positive. Setting any parameter to `0`, leaving it blank or omitting it disables
 that backoff, including the stop after exhausted HTTP 429 cooldowns. A disabled
@@ -144,9 +145,10 @@ Gmail is optional. Set the sender address in `GMAIL_EMAIL`, a
 `GMAIL_APPLICATION_PWD`, and the recipient in `RECEIVER_EMAIL`. Check it separately
 with `python tests/integration/test_check_gmail.py`; this sends one real test email.
 
-Unit tests live in `tests/unit` and use mocked portal/SMTP responses. Run them with:
+Unit tests live in `tests/unit` and use mocked portal/SMTP responses. Install the application extras for the full suite, then run:
 
 ```sh
+python -m pip install -e ".[node,coordinated,coordinator]"
 python -m unittest discover -s tests/unit -t . -v
 ```
 
@@ -163,13 +165,36 @@ It may not always be feasible to reschedule an appointment multiple times. There
 
 Consulates other than Toronto and Vancouver are not tested.
 
-## Development plan
+## Coordinated mode
 
-The [Node and Coordinator plan](docs/coordinated-mode-plan.md) describes the planned coordinated mode, API contracts, token portal, and three connection options: Tailscale, a temporary Cloudflare Tunnel, or Cloudflare Tunnel on your own domain.
+The [setup guide](docs/coordinated-setup.md) covers the working Node/Coordinator system and all three connection options: Tailscale, a temporary Cloudflare Tunnel, or Cloudflare Tunnel on your own domain. The [architecture and API contract](docs/coordinated-mode-plan.md) describe the protocol and delivery guarantees.
 
-The package migration is implemented; the current runnable mode is solo. Coordinated services are under development. The compatible `python reschedule.py` launcher remains available, and an editable installation also provides `usvisa-node --mode solo` and `python -m usvisa.node`.
+Both `solo` and `coordinated` monitoring modes are implemented. Solo remains the default. The compatible `python reschedule.py` launcher remains available, and an editable installation also provides `usvisa-node --mode solo`, `usvisa-node --mode coordinated`, and `python -m usvisa.node`.
+
+To try the server without your own domain (Docker required):
+
+```sh
+python scripts/server.py setup --profile cloudflare_quick
+python scripts/server.py up --server-only
+python scripts/server.py create-user --username admin
+```
+
+Open the displayed HTTPS URL, sign in, create a node, and save its token/configuration. Install `python -m pip install -e ".[node,coordinated]"` on each Node, fill its local visa settings, set `MODE=coordinated`, `SERVER_URL`, `NODE_TOKEN`, and `NODE_MIN_DATE`, then launch it. Each node polls every 180 seconds with evenly spaced phases (90 seconds apart for two nodes). Heartbeats and delivery run independently of the visa worker. Use `TEST_MODE=true` for the first run.
+
+For a combined Docker deployment, save `PORTAL_USERNAME`, `PORTAL_PASSWORD`, and `NODE_NAME` in the private `.env` instead of copying a token. Keep `COMPOSE_PROFILES=${MODE:-solo},${MODE:-solo}-${EXPOSE_MODE:-cloudflare_quick}` alongside `MODE` and `EXPOSE_MODE`. Then `docker compose up -d --build` starts the Coordinator and a Chromium-equipped Node, registers it once, persists its token, receives a schedule, and runs the existing visa worker. `MODE=solo` selects only the Node. Use `python scripts/server.py up --mode solo` or `--mode coordinated` to switch modes and stop unused services automatically. The local Node and Coordinator discover changing Quick Tunnel hostnames without Docker socket access; remote nodes still need their `SERVER_URL` updated. See the setup guide for persistent state and first-account setup.
 
 Application code lives in `src/usvisa`: `node` runs the account worker, `coordinator` owns the server entry point, `visa` contains login and HTTP booking, `notifications` delivers email, and `shared` contains paths and audit. Both application entry points support `--help` without importing browser or broker clients.
+
+The `protocol` package validates all five versioned JSON messages. The Coordinator core persists membership, schedule UUID/revision, evenly spaced 180-second phases, deduplication, findings and a transactional outbox in SQLite. Each recipient receives a personal schedule; findings are filtered against the recipient's own `minDate`. Restarting preserves state and pending message IDs. Local commands work without RabbitMQ or visa credentials:
+
+```sh
+usvisa-coordinator init-db --consulate-id 95 --city Vancouver
+usvisa-coordinator state
+```
+
+The default database is `.coordinator/state.sqlite3` under the data directory; pass `--database PATH` before the subcommand to override it. These commands initialize or inspect local state. `usvisa-coordinator serve` starts the portal and AMQP services; the Compose launcher supplies its configuration and persists both SQLite and RabbitMQ volumes. Server dependencies are pinned in `requirements-coordinator.lock`; the portal's compiled Tailwind CSS is included, so deployment does not require npm.
+
+The opt-in integration suites verify a real RabbitMQ restart, WSS delivery through a real Quick Tunnel, queue permissions, validated user IDs, credential rotation, and revocation without contacting the visa site or SMTP. See the setup guide for exact commands, profile switching and backups.
 
 The default .env, .sessions, logs and .booking-state locations stay at the checkout root, independent of the working directory. Set USVISA_ENV_FILE to choose a configuration file and USVISA_DATA_DIR to choose a state directory. Relative overrides resolve from the checkout root; installed packages outside a checkout use the launch directory as their default. Existing booking guards must be retained when changing the state directory.
 

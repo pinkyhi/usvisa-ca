@@ -1,7 +1,9 @@
 """Selenium sign-in; the HTTP client takes over after authentication."""
+import os
 
 from selenium import webdriver
 from selenium.webdriver.chrome.webdriver import WebDriver
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -13,6 +15,8 @@ from usvisa.node.settings import (
 
 def get_chrome_driver() -> WebDriver:
     options = webdriver.ChromeOptions()
+    if os.getenv("CHROME_BINARY"):
+        options.binary_location = os.environ["CHROME_BINARY"]
     if not SHOW_GUI:
         options.add_argument("--headless=new")
         options.add_argument("window-size=1920x1080")
@@ -21,7 +25,22 @@ def get_chrome_driver() -> WebDriver:
     options.add_argument('--incognito')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
-    driver = webdriver.Chrome(options=options)
+    if os.getenv("CHROMEDRIVER_PATH"):
+        driver = webdriver.Chrome(service=Service(os.environ["CHROMEDRIVER_PATH"]), options=options)
+    else:
+        driver = webdriver.Chrome(options=options)
+    try:
+        if not SHOW_GUI:
+            user_agent = driver.execute_script("return navigator.userAgent")
+            if "HeadlessChrome/" in user_agent:
+                # AIS rejects the headless product name before rendering the
+                # sign-in form. Keep the installed Chromium version/platform.
+                driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                    "userAgent": user_agent.replace("HeadlessChrome/", "Chrome/"),
+                })
+    except BaseException:
+        driver.quit()
+        raise
     return driver
 
 

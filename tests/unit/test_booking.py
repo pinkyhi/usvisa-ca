@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from usvisa.shared import audit
 from contextlib import redirect_stdout
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, Mock, patch
 
 import requests
@@ -112,6 +112,23 @@ class BookingTests(NoNetworkTest):
         self.session.post.assert_not_called()
         self.assertEqual(self.session.get.call_count, 2)
         self.assertEqual(self.session.get.call_args.kwargs["params"]["date"], DAY.isoformat())
+
+    def test_received_slot_already_expired_does_not_query_or_reserve_a_submission(self):
+        expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+        self.assertIsNone(self.client.book(DAY, dry_run=False, expires_at=expired))
+        self.session.get.assert_not_called()
+        self.session.post.assert_not_called()
+        self.assertFalse((audit.GUARD_DIR / "123.json").exists())
+
+    def test_received_slot_expiring_during_times_get_cannot_submit_or_create_guard(self):
+        self.prepare()
+        observed = datetime.now(timezone.utc)
+        with patch("usvisa.visa.appointment_client.datetime") as clock:
+            clock.now.side_effect = [observed, observed + timedelta(seconds=2)]
+            self.assertIsNone(self.client.book(DAY, dry_run=False, expires_at=observed + timedelta(seconds=1)))
+        self.assertEqual(self.session.get.call_count, 2)
+        self.session.post.assert_not_called()
+        self.assertFalse((audit.GUARD_DIR / "123.json").exists())
 
     def test_booking_preserves_form_fields_and_verifies_fresh_saved_record(self):
         self.prepare()

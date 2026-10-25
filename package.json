@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "scripts": {"build:css": "tailwindcss -i src/usvisa/coordinator/static/portal.tailwind.css -o src/usvisa/coordinator/static/styles.css --minify"},
+  "devDependencies": {"@tailwindcss/cli": "^4.1.0", "tailwindcss": "^4.1.0"}
+}

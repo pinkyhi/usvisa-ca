@@ -1,0 +1,283 @@
+# Запуск Node и Coordinator
+
+Docker Compose запускает Coordinator и Node вместе. Образ Node содержит Chromium и совместимый драйвер; Python и Chrome на хосте для обычного запуска не нужны. Ноду также можно запустить отдельно через Python 3.11+. Белый IP и проброс портов роутера не нужны. У всех нод один город; `setup` берёт его из `USER_CONSULATE` в `.env`, если `--city` не указан явно.
+
+Все команды ниже выполняются из корня репозитория. `python` должен указывать на Python 3.11 или новее. На Windows можно использовать `py -3.11` или `.venv\Scripts\python.exe`.
+
+## Обычный запуск через Docker
+
+В `.env` сохраните настройки визового аккаунта, фильтры дат и режим бронирования. Для совместной работы добавьте:
+
+```dotenv
+MODE=coordinated
+EXPOSE_MODE=cloudflare_quick
+COMPOSE_PROFILES=${MODE:-solo},${MODE:-solo}-${EXPOSE_MODE:-cloudflare_quick}
+PORTAL_USERNAME=admin
+PORTAL_PASSWORD=your-portal-password
+NODE_NAME=Main Node
+```
+
+Если сервер и учётная запись уже созданы, достаточно:
+
+```sh
+docker compose up -d --build
+```
+
+Запускаются Node, Coordinator, RabbitMQ, edge и выбранный tunnel. Node входит в портал по HTTPS, получает персональный токен, подключается по WSS, отправляет heartbeat, получает расписание и запускает прежний визовый worker. `NODE_MIN_DATE` по умолчанию берётся из `LATEST_ACCEPTABLE_DATE`; ручной `NODE_TOKEN` также поддерживается. Пароль портала не добавляется в сообщения брокера.
+
+`docker compose logs -f node` показывает подключение к Coordinator, сохранённое или новое расписание, готовность визовой сессии, время следующей проверки и число найденных дат, включая ноль. Сообщение о временной недоступности регистрации означает переход на сохранённые credentials; восстановление соединения выводится отдельно. В стандартном Docker-образе время логов — UTC; время следующей проверки также содержит явное смещение `+00:00`.
+
+Токен, `nodeId` и ключ регистрации сохраняются в `.node-state/registration.json`. Повторный запуск использует ту же ноду. Потерянный после создания ответ восстанавливается перевыпуском токена для той же ноды; отозванная нода автоматически не восстанавливает доступ. `.sessions`, `.booking-state`, `.node-state` и `logs` подключены с хоста; остальное состояние Node хранится в volume. В контейнере браузер работает без графического окна.
+
+Для смены режима с остановкой лишних сервисов:
+
+```sh
+python scripts/server.py up --mode solo
+python scripts/server.py up --mode coordinated
+```
+
+При `MODE=solo` Compose выбирает только Node. При ручной смене `.env` сначала выполните `docker compose --profile "*" down`, затем `docker compose up -d --build`: Compose сам не останавливает уже работающие сервисы выключенного профиля. Команда `down` без `-v` сохраняет volumes.
+
+Диагностика регистрации и расписания без обращения к визовому сайту:
+
+```sh
+docker compose run --rm --no-deps node usvisa-node --check-coordination
+```
+
+## 1. Выберите способ подключения сервера
+
+### Временный Cloudflare Tunnel
+
+Это самый короткий способ попробовать систему без своего домена:
+
+```sh
+python scripts/server.py setup --profile cloudflare_quick
+python scripts/server.py up --server-only
+python scripts/server.py create-user --username admin
+```
+
+`setup` генерирует административные секреты в локальном `.server.env`, исключённом из Git. `up` собирает контейнеры, запускает брокер и портал, получает временный HTTPS адрес, сохраняет его как `PUBLIC_BASE_URL` и выводит адрес портала. `create-user` спрашивает пароль скрытым вводом. Логин не требует email; пароль — от 8 до 1024 символов. Создайте таким же способом отдельную учётную запись для друга с другим логином.
+
+Портал и `/ws` работают на одном адресе. На компьютерах нод не нужны Cloudflare аккаунт, cloudflared или WARP. Coordinator и локальная Docker-нода обнаруживают актуальный hostname через внутренний endpoint cloudflared `/quicktunnel`; при рестарте tunnel адрес обновляется автоматически, включая повторное WSS подключение. Порт metrics на хост не публикуется, Docker socket не подключается. Для удалённых нод новый адрес по-прежнему передаётся явно через `SERVER_URL`; автоматическое обнаружение на сервере не заменяет постоянный адрес для других компьютеров. Токены, очереди и состояние сохраняются. [Endpoint в исходниках cloudflared](https://github.com/cloudflare/cloudflared/blob/master/metrics/metrics.go).
+
+Не включайте интерактивный email PIN на общем tunnel с `/ws`. Quick Tunnel предназначен для тестирования; для постоянного адреса выберите один из следующих профилей. [Официальная документация Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/).
+
+### Tailscale
+
+Установите Tailscale на сервере и на компьютерах нод, войдите в свой tailnet и разрешите нужным устройствам HTTPS к серверу. Найдите HTTPS имя сервера в Tailscale, например `visa-server.example.ts.net`, и включите HTTPS для tailnet, если Serve предложит это при первом запуске.
+
+```sh
+python scripts/server.py setup --profile tailscale --url https://visa-server.example.ts.net
+python scripts/server.py up --server-only
+python scripts/server.py create-user --username admin
+```
+
+На хосте должен быть доступен `tailscale` в PATH. Launcher выполняет `tailscale serve --bg http://127.0.0.1:8080`. Serve обслуживает HTTPS/WSS внутри tailnet и сохраняет настройку для последующих запусков. ACL/grants tailnet должны ограничивать доступ к HTTPS сервера выбранными участниками. Caddy не требуется. [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve).
+
+### Cloudflare Tunnel на своём домене
+
+В Cloudflare создайте named tunnel и публичный hostname, например `visa.example.com`. В его настройках задайте service **HTTP → `edge:8080`**: connector работает в той же Docker сети, что и Nginx. Скопируйте token connector.
+
+```sh
+python scripts/server.py setup --profile cloudflare_domain --url https://visa.example.com
+python scripts/server.py up --server-only
+python scripts/server.py create-user --username admin
+```
+
+`setup` спросит tunnel token скрытым вводом и сохранит его в `.server.env`. На нодах нужны только HTTPS адрес и личный Node token. Домен сохраняется при перезапусках. Cloudflare Access не требуется; если вы добавите его самостоятельно на `/ws`, понадобятся дополнительные machine credentials, которых базовый клиент не использует. [Настройка named tunnel](https://developers.cloudflare.com/tunnel/get-started/).
+
+HTTPS/WSS в Cloudflare профилях заканчивается на Cloudflare. Визовые пароль и cookies остаются локальными у Node; они не входят в сообщения Coordinator.
+
+## 2. Получите личный токен в портале
+
+1. Откройте адрес, который вывел `up`.
+2. Войдите с логином и паролем, заданными через `create-user`.
+3. Создайте ноду и сохраните показанный конфиг. Токен показывается только один раз.
+4. Для второго компьютера создайте отдельную ноду. Не запускайте один токен на двух компьютерах.
+
+При создании автоматически появляются RabbitMQ пользователь, durable очередь, адресные bindings, минимальные права и ограничение одного соединения. Никакого ручного rabbitmqctl пользователям не требуется. До первого heartbeat нода имеет статус ожидания и не занимает фазу.
+
+«Новый токен» сохраняет nodeId и очередь, меняет пароль и закрывает прежнее соединение. «Отозвать» сразу исключает ноду из расписания, закрывает соединения и удаляет RabbitMQ пользователя. Офлайн скрипт с сохранённым расписанием продолжает локальную работу: отзыв брокера не является удалённой командой остановки визового worker.
+
+Если создание вернуло временную ошибку брокера, повторная отправка той же формы дозавершает ту же операцию. Если успешный ответ с токеном был потерян, перевыпустите токен: завершённая выдача не раскрывает секрет повторно.
+
+## 3. Настройте Node
+
+Для новых нод Docker не нужен. Coordinator продолжает работать на сервере; каждый компьютер подключается к нему по HTTPS/WSS на порту 443. Для текущего Cloudflare Tunnel устанавливать Tailscale, RabbitMQ или открывать входящие порты на компьютере ноды не требуется.
+
+### Подготовка компьютера без Docker
+
+Установите Python 3.11 или новее и Google Chrome. Скопируйте или клонируйте репозиторий в отдельную папку на компьютере новой ноды. В PowerShell из корня этой копии:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[node,coordinated]"
+Copy-Item .env.example .env
+```
+
+`Copy-Item` нужен только в новой копии без существующего `.env`. Активация виртуального окружения не требуется: команды ниже используют его Python напрямую. На macOS/Linux аналогичные команды установки — `python3 -m venv .venv`, `.venv/bin/python -m pip install -e ".[node,coordinated]"` и `cp .env.example .env`.
+
+### Вход и получение токена для каждой новой ноды
+
+1. Откройте актуальный HTTPS-адрес портала и войдите по логину и паролю портала. Один пользователь может иметь несколько нод; отдельная учётная запись на каждую ноду не нужна. Для другого владельца серверный администратор может создать отдельную учётку командой `docker compose exec coordinator usvisa-coordinator create-user --username friend` на сервере; пароль вводится в интерактивном запросе.
+2. В **My nodes → Connect a node** введите имя компьютера и нажмите **Create node +**. Сервер создаст отдельные `nodeId`, пользователя RabbitMQ, персональную очередь и токен. Пока нода не отправила heartbeat, статус будет **Waiting for heartbeat**.
+3. Нажмите **Copy configuration** и сохраните полученный блок в `.env` этой ноды. Токен показывается один раз. **New token** перевыпускает токен уже существующей ноды, поэтому для нового компьютера используйте именно **Create node +**.
+4. В том же `.env` задайте свои визовые credentials, диапазон дат и режим работы. Логин портала и логин визового сайта — разные учётные данные; при ручном `NODE_TOKEN` сохранять пароль портала в `.env` не требуется.
+
+Пример итогового `.env` для текущей группы Calgary; адрес и токен возьмите из своего блока конфигурации:
+
+```dotenv
+MODE=coordinated
+SERVER_URL=https://your-server.example
+NODE_TOKEN=full_token_from_portal
+NODE_MIN_DATE=2027-05-01
+QUICK_TUNNEL_METRICS=
+
+USER_EMAIL=your-visa-account@example.com
+USER_PASSWORD=your-visa-password
+USER_CONSULATE=Calgary
+EARLIEST_ACCEPTABLE_DATE=2026-11-01
+LATEST_ACCEPTABLE_DATE=2027-05-01
+
+TEST_MODE=true
+RUN_ONCE=false
+SHOW_GUI=false
+PERSIST_SESSION=true
+```
+
+`NODE_MIN_DATE` — личный порог уведомлений: полезны даты строго раньше него. `EARLIEST_ACCEPTABLE_DATE`, `LATEST_ACCEPTABLE_DATE` и исключения управляют собственным booking. Совпадение города/consulateId с сервером обязательно; клиент останавливается при несовпадении.
+
+### Проверка связи и запуск
+
+В PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m usvisa.node --check-coordination
+.\.venv\Scripts\python.exe -m usvisa.node
+```
+
+Первая команда получает расписание и завершает работу без обращения к визовому сайту. Вторая запускает обычный worker. На macOS/Linux замените `.\.venv\Scripts\python.exe` на `.venv/bin/python`. Прежняя команда `python reschedule.py` также поддерживается при активном виртуальном окружении.
+
+После запуска должны появиться `Coordinator connected`, `Visa worker ready` и `Next date check at ...`; в портале — **In schedule**. Selenium запускает локальный Chrome без окна для входа, затем браузер закрывается, а проверки продолжаются HTTP-клиентом. Selenium подбирает ChromeDriver автоматически; при первом входе ему может потребоваться доступ в интернет для скачивания драйвера. `SHOW_GUI=true` позволяет видеть окно входа на обычном компьютере.
+
+`TEST_MODE=true` оставляет проверку в тестовом режиме без отправки booking POST. Для реального бронирования установите `TEST_MODE=false` и перезапустите ноду. `RUN_ONCE=false` оставляет её в постоянном цикле. Остановка — Ctrl+C; повторный запуск использует прежний токен и локальное состояние. На новый компьютер переносите исходники, но создавайте собственный `.env` и токен: `.node-state`, `.sessions` и `.booking-state` принадлежат конкретной ноде и её визовой сессии.
+
+При переносе уже существующей ноды на другой компьютер сначала остановите старый процесс и сохраните её состояние, включая `.booking-state`: защита от повторной отправки booking POST должна пережить перенос.
+
+Если используете временный Cloudflare Quick Tunnel, после смены его адреса обновите `SERVER_URL` у удалённой ноды и перезапустите её. Автообнаружение через `http://quick:20241/quicktunnel` работает только внутри серверной Docker-сети; поэтому для удалённой ноды `QUICK_TUNNEL_METRICS` оставлен пустым.
+
+### Автоматическая регистрация вместо ручного токена
+
+Можно пропустить **Create node +** в браузере и указать `PORTAL_USERNAME`, `PORTAL_PASSWORD`, `NODE_NAME` и `SERVER_URL` в `.env`, оставив `NODE_TOKEN` пустым. При первом запуске нода сама войдёт в портал, создаст свою запись и сохранит токен в `.node-state/registration.json`. Последующие запуски используют ту же запись. Для каждой новой ноды нужна отдельная папка состояния. Используйте один способ: ручной токен или автоматическую регистрацию, иначе вручную созданная запись останется неиспользованной.
+
+Сначала получите снимок расписания; затем Node использует сохранённую HTTP сессию или входит через Selenium. Heartbeat каждые 30 секунд идёт в отдельном потоке и не ждёт Selenium, availability GET, booking или локального backoff.
+
+У каждой ноды период 180 секунд: две ноды получают фазы с разницей 90 секунд, три — 60 секунд. Минимум 180 секунд между обычными запросами сохраняется и после рестарта. Таймер допускает до одной секунды задержки ОС внутри фазы; более длинные паузы, backoff и пропущенные фазы не вызывают догоняющей серии запросов. `DATE_REQUEST_DELAY` применяется в solo; coordinated использует фиксированный период 180. Настройки циклических пауз и HTTP 429 действуют в обоих режимах.
+
+При потере сервера Node продолжает последнее расписание. На первом запуске без снимка ждёт сервер. Отсутствие heartbeat 540 секунд исключает ноду из серверного состава; очередь и токен сохраняются. Возвращение восстанавливает участие свежим heartbeat.
+
+Находки передаются без своей подтверждённой или потенциально забронированной даты; TEST_MODE кандидат остаётся находкой. Coordinator направляет каждую дату только другим активным нодам, которым она подходит по minDate. Весь срок жизни находки — 180 секунд от наблюдения, включая очередь, повторную публикацию и локальный worker. Собственные фильтры получателя применяются перед подготовкой booking.
+
+`TEST_MODE=true` готовит форму без booking POST. `RUN_ONCE=true` выполняет одну обычную проверку в назначенной фазе и завершает работу. Подтверждённый booking и неизвестный исход останавливают worker. Существующий `.booking-state` guard используется при любом источнике даты и остаётся после попытки POST.
+
+## Solo и хранение состояния
+
+```sh
+usvisa-node --mode solo
+usvisa-node --mode coordinated
+```
+
+Можно также изменить `MODE` в `.env` и перезапустить процесс. Solo не требует Coordinator или сетевого токена. Автоматического перехода в solo при разрыве связи нет.
+
+| Данные | Где находятся |
+| --- | --- |
+| Учётные записи портала, сессии, расписание, inbox/outbox | Volume `usvisa_coordinator`, `/data/.coordinator/state.sqlite3` |
+| RabbitMQ пользователи, очереди, persistent сообщения | Volume `usvisa_rabbitmq` |
+| Серверные credentials и текущий публичный адрес | `.server.env` на хосте |
+| Локальный снимок, обычная проверка, задачи, исходящие находки | `.node-state/<nodeId>/state.sqlite3` у Node |
+| Визовые cookies | Прежний `.sessions` у Node |
+| Защита booking POST | Прежний `.booking-state` у Node |
+
+Имена volumes используют префикс `--project`, если вы его переопределили. `USVISA_DATA_DIR` и `USVISA_ENV_FILE` по-прежнему поддерживаются; перед переносом скопируйте существующий booking guard в новое место. Не удаляйте guard ради сброса сетевого расписания.
+
+## Управление сервером и смена профиля
+
+```sh
+python scripts/server.py status
+python scripts/server.py down
+python scripts/server.py up
+```
+
+`down` сохраняет volumes. Для смены профиля повторите `setup` с тем же `.server.env` и именем проекта, затем `up`. Пользователи, nodeId, токены и очередь остаются прежними; ноды меняют только `SERVER_URL`. Браузерная сессия на старом origin не переносится.
+
+Если меняете Cloudflare профиль на Tailscale или обратно, старый connector останавливается. Если ранее включали Tailscale Serve и он больше не нужен, отключите именно настройку этого проекта: `tailscale serve --https=443 off`. Launcher не сбрасывает чужие настройки Tailscale на хосте.
+
+Другой город задаётся при setup: `--consulate-id 94 --city Toronto`. Существующие ноды также должны изменить локальный USER_CONSULATE. Смена только общего порога не сдвигает фазы.
+
+Серверные контейнеры и tunnel перезапускаются автоматически. Node сохраняет прежнее завершение после успешной брони, `RUN_ONCE` или неопределённого исхода booking: restart policy для него отключена, чтобы завершённая задача не запускалась повторно. На сервере включите автозапуск Docker. Для Tailscale дополнительно работает системный сервис Tailscale и Serve `--bg`. Локальные Coordinator и Node сами подхватывают новый Quick Tunnel hostname; named tunnel сохраняет hostname.
+
+Единственный порт на хосте — Nginx `127.0.0.1:8080`; `--port` меняет локальный порт. AMQP, Management API и Web STOMP listener в Compose не публикуются. Во внешней сети используются HTTPS/WSS выбранного Serve/Tunnel. Портал защищён собственным входом, а `/ws` — персональным RabbitMQ токеном. TLS цепочка и hostname проверяются; опции отключения проверки сертификатов нет.
+
+## Резервное копирование
+
+Онлайн копия SQLite:
+
+```sh
+python scripts/server.py backup
+docker compose --env-file .server.env cp coordinator:/data/backups ./backups
+```
+
+Сохраните `.server.env` отдельно в приватном месте и перенесите копии с сервера на другой носитель. Онлайн копия SQLite не является копией очередей RabbitMQ.
+
+Для полного согласованного снимка остановите приложения, не удаляя volumes. Сделайте копии обоих volumes средствами Docker/вашего бэкап-инструмента и `.server.env`, затем запустите сервер прежним профилем. При восстановлении используйте те же имена проекта и версию RabbitMQ. Сохранённые сообщения имеют прежний абсолютный срок; просроченные находки не оживают после восстановления.
+
+Не используйте `docker compose down -v` для обычного перезапуска: эта команда удаляет данные. При откате Coordinator к старой резервной копии revision тоже откатывается: остановите ноды и удалите только запись `schedule` из таблицы `meta` их сетевой SQLite, сохранив last_check, задачи и booking guard; после запуска ноды запросят текущий снимок. Обычный рестарт без отката не требует этого действия.
+
+## Проверки без реальной брони
+
+Установите зависимости тестируемых приложений:
+
+```sh
+python -m pip install -e ".[node,coordinated,coordinator]"
+python -m unittest discover -s tests/unit -t . -v
+```
+
+Отдельный loopback стенд для интеграции, без доступа к визовому сайту:
+
+```sh
+python scripts/server.py --env-file artifacts/test-server.env --project usvisa-test setup --profile tailscale --city Vancouver --consulate-id 95 --port 8187 --local-test
+python scripts/server.py --env-file artifacts/test-server.env --project usvisa-test up --server-only
+```
+
+В PowerShell:
+
+```powershell
+$env:RUN_COORDINATED_INTEGRATION='true'
+python -m unittest tests.integration.test_coordinated_stack -v
+```
+
+В POSIX shell: `RUN_COORDINATED_INTEGRATION=true python -m unittest tests.integration.test_coordinated_stack -v`.
+
+Тест создаёт отдельную учётку, получает два токена, проверяет расписание, очередь при рестарте именно тестового брокера, дедупликацию, ограничение второго подключения, ротацию и отзыв. Отдельная проверка поднимает локальный TLS listener: клиент отклоняет недоверенную цепочку, а при явном доверии тестовому сертификату — несовпадение hostname. Оба отказа происходят до отправки Node credentials.
+
+Чтобы повторить проверку через реальный HTTPS/WSS Quick Tunnel, переключите тот же тестовый проект:
+
+```sh
+python scripts/server.py --env-file artifacts/test-server.env --project usvisa-test setup --profile cloudflare_quick --city Vancouver --consulate-id 95 --port 8187
+python scripts/server.py --env-file artifacts/test-server.env --project usvisa-test up --server-only
+```
+
+Затем PowerShell:
+
+```powershell
+$env:RUN_PUBLIC_PROFILE_INTEGRATION='true'
+python -m unittest tests.integration.test_public_profile -v
+```
+
+Тест использует изолированную учётку, сохранённую первым тестом в `artifacts/browser-test.json`, и URL из `artifacts/test-server.env`. Проверяет WSS, персональные назначения, находки, heartbeat при блокировке основного потока, закрытие соединения при ротации, запрет чтения чужой очереди, публикации в серверный exchange и подмены user-id. Дополнительно запускает реальный `Node.main()` с подменёнными визовой сессией и первым таймером: получение расписания, worker, локальная SQLite, отправка находки и выход работают вместе через WSS. Он подходит и для Tailscale/named tunnel, если в тестовом env указан их origin, а машина тестирования имеет доступ.
+
+Для окончания теста выполните `python scripts/server.py --env-file artifacts/test-server.env --project usvisa-test down`. Это отключает только тестовые контейнеры и tunnel. Артефакты с тестовыми credentials исключены из Git.
+
+В production `ALLOW_INSECURE_LOCALHOST` оставляется false. `--local-test` разрешает HTTP исключительно для localhost/127.0.0.1; удалённый HTTP не разрешается ни с этим флагом, ни без него.
+
+Для пересборки UI нужны Node.js и `npm ci && npm run build:css`. Готовый CSS уже включён в пакет, npm при запуске сервера не требуется.

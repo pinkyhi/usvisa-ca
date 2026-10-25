@@ -453,11 +453,19 @@ class AppointmentClient:
                 return True
         return False
 
-    def book(self, day, dry_run=True):
+    def book(self, day, dry_run=True, *, expires_at=None):
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+            audit.event("shared_slot_expired", date=day)
+            return None
         # GET the form before querying times so cookie/CSRF rotation is retained.
         fields, csrf = self._booking_form()
         times = self.get_available_times(day)
         if not times:
+            return None
+        # A received finding can expire while form/times GETs are in flight.
+        # Recheck before preparing a result or reserving a booking submission.
+        if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
+            audit.event("shared_slot_expired", date=day)
             return None
         slot_time = times[0]
         prefix = "appointments[consulate_appointment]"

@@ -1,0 +1,87 @@
+@import "tailwindcss";
+@source "../templates";
+@source "./portal.js";
+
+/* tweakcn Claude theme: https://tweakcn.com/r/themes/claude.json (Apache-2.0).
+   Theme variables are fixed here once; the compiled stylesheet is shipped. */
+@theme inline {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+:root {
+  --background: oklch(0.9818 0.0054 95.0986);
+  --foreground: oklch(0.3438 0.0269 95.7226);
+  --card: oklch(0.9818 0.0054 95.0986);
+  --card-foreground: oklch(0.1908 0.0020 106.5859);
+  --popover: oklch(1.0000 0 0);
+  --popover-foreground: oklch(0.2671 0.0196 98.9390);
+  --primary: oklch(0.5500 0.1375 39.0427);
+  --primary-foreground: oklch(1.0000 0 0);
+  --secondary: oklch(0.9245 0.0138 92.9892);
+  --secondary-foreground: oklch(0.4334 0.0177 98.6048);
+  --muted: oklch(0.9341 0.0153 90.2390);
+  --muted-foreground: oklch(0.5000 0.0075 97.4233);
+  --accent: oklch(0.9245 0.0138 92.9892);
+  --accent-foreground: oklch(0.2671 0.0196 98.9390);
+  --destructive: oklch(0.1908 0.0020 106.5859);
+  --destructive-foreground: oklch(1.0000 0 0);
+  --border: oklch(0.8847 0.0069 97.3627);
+  --input: oklch(0.6500 0.0156 98.3528);
+  --ring: oklch(0.6171 0.1375 39.0427);
+  --chart-1: oklch(0.5583 0.1276 42.9956);
+  --chart-2: oklch(0.6898 0.1581 290.4107);
+  --chart-3: oklch(0.8816 0.0276 93.1280);
+  --chart-4: oklch(0.8822 0.0403 298.1792);
+  --chart-5: oklch(0.5608 0.1348 42.0584);
+  --radius: 0.5rem;
+  --sidebar: oklch(0.9663 0.0080 98.8792);
+  --sidebar-foreground: oklch(0.3590 0.0051 106.6524);
+  --sidebar-primary: oklch(0.6171 0.1375 39.0427);
+  --sidebar-primary-foreground: oklch(0.9881 0 0);
+  --sidebar-accent: oklch(0.9245 0.0138 92.9892);
+  --sidebar-accent-foreground: oklch(0.3250 0 0);
+  --sidebar-border: oklch(0.9401 0 0);
+  --sidebar-ring: oklch(0.7731 0 0);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif, 'Apple Color Emoji', 'Segoe UI Emoji', 'Segoe UI Symbol', 'Noto Color Emoji';
+  --font-serif: ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  --shadow-color: oklch(0 0 0);
+  --shadow-opacity: 0.1;
+  --shadow-blur: 3px;
+  --shadow-spread: 0px;
+  --shadow-offset-x: 0;
+  --shadow-offset-y: 1px;
+  --letter-spacing: 0em;
+  --spacing: 0.25rem;
+  --shadow-2xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+  --shadow-xs: 0 1px 3px 0px hsl(0 0% 0% / 0.05);
+  --shadow-sm: 0 1px 3px 0px hsl(0 0% 0% / 0.10), 0 1px 2px -1px hsl(0 0% 0% / 0.10);
+  --shadow: 0 1px 3px 0px hsl(0 0% 0% / 0.10), 0 1px 2px -1px hsl(0 0% 0% / 0.10);
+  --shadow-md: 0 1px 3px 0px hsl(0 0% 0% / 0.10), 0 2px 4px -1px hsl(0 0% 0% / 0.10);
+  --shadow-lg: 0 1px 3px 0px hsl(0 0% 0% / 0.10), 0 4px 6px -1px hsl(0 0% 0% / 0.10);
+  --shadow-xl: 0 1px 3px 0px hsl(0 0% 0% / 0.10), 0 8px 10px -1px hsl(0 0% 0% / 0.10);
+  --shadow-2xl: 0 1px 3px 0px hsl(0 0% 0% / 0.25);
+  --tracking-normal: 0em;
+}
+
+@layer base {
+  body { background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
+  header, .panel { border-color: var(--border); }
+  input, textarea { border: 1px solid var(--input); border-radius: .5rem; padding: .75rem 1rem; background: var(--card); color: var(--foreground); }
+  input:focus-visible, textarea:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+  button { cursor: pointer; }
+  button:disabled { cursor: wait; opacity: .6; }
+}
+@layer components {
+  .muted { color: var(--muted-foreground); }
+  .panel { border: 1px solid var(--border); background: var(--card); border-radius: .875rem; box-shadow: 0 2px 8px #00000004; }
+  .brand-mark { display: grid; place-items: center; width: 2rem; height: 2rem; border-radius: .625rem; background: var(--primary); color: var(--primary-foreground); }
+  .eyebrow { color: var(--primary); font-size: .6875rem; font-weight: 650; letter-spacing: .14em; text-transform: uppercase; }
+  .button { display: inline-flex; align-items: center; justify-content: center; border-radius: .5rem; padding: .7rem 1.1rem; background: var(--primary); color: var(--primary-foreground); font-weight: 600; min-height: 44px; transition: filter .12s; }
+  .button:hover { filter: brightness(.94); }
+  .secondary { background: var(--card); color: var(--foreground); border: 1px solid var(--border); }
+  .danger { background: transparent; color: #9b342d; }
+  .badge { border: 1px solid var(--border); border-radius: 2rem; padding: .5rem .8rem; color: var(--muted-foreground); font-size: .75rem; }
+  .empty-state { padding: 3rem 2rem; text-align: center; border: 1px dashed var(--border); border-radius: .875rem; color: var(--muted-foreground); line-height: 1.7; }
+  .notice { padding: 1rem; border-radius: .5rem; background: var(--muted); font-size: .875rem; }
+  .notice[data-error=true] { color: #9b342d; background: #fff0ed; }
+}

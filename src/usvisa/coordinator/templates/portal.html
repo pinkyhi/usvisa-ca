@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visa · Coordinator</title>
+  <link rel="stylesheet" href="/static/styles.css"><script src="/static/portal.js" defer></script>
+</head>
+<body data-page="{{ page }}" data-city="{{ city }}" class="min-h-screen">
+  <header class="border-b px-6 py-5 sm:px-10"><div class="mx-auto flex max-w-5xl items-center justify-between gap-4">
+    <a href="/" class="flex items-center gap-3 font-semibold"><span class="brand-mark" aria-hidden="true">V</span> Visa <span class="font-normal muted">/ Coordinator</span></a>
+    {% if page == 'nodes' %}<button id="logout" class="button secondary text-sm">Sign out</button>{% endif %}
+  </div></header>
+  <main class="mx-auto max-w-5xl px-6 py-12 sm:px-10 sm:py-16">
+    {% if page == 'login' %}
+    <div class="mx-auto max-w-md">
+      <p class="eyebrow mb-4">One group. A shared rhythm.</p><h1 class="mb-3 text-4xl font-semibold tracking-tight">Sign in to Coordinator</h1>
+      <p class="muted mb-8 leading-relaxed">Connect your node and take turns checking for appointments.</p>
+      <form id="login" class="panel grid gap-5 p-6 sm:p-8">
+        <label class="grid gap-2 text-sm font-medium">Username<input name="username" type="text" autocomplete="username" required maxlength="254" autocapitalize="none" spellcheck="false" placeholder="admin"></label>
+        <label class="grid gap-2 text-sm font-medium">Password<input name="password" type="password" autocomplete="current-password" required minlength="8" maxlength="1024"></label>
+        <button class="button" type="submit">Sign in →</button>
+        <p class="muted text-xs leading-relaxed">The server owner creates your account.</p>
+      </form>
+    </div>
+    {% else %}
+    <div class="mb-10 flex flex-wrap items-end justify-between gap-5">
+      <div><p class="eyebrow mb-3">Workspace</p><h1 class="text-4xl font-semibold tracking-tight">My nodes</h1><p id="account" class="muted mt-3">Loading account…</p></div>
+      <span class="badge">{{ city }} · every 3 minutes</span>
+    </div>
+    <section class="panel mb-8 p-6"><h2 class="mb-2 text-lg font-semibold">Connect a node</h2><p class="muted mb-5 text-sm">Give it a name, such as “Home computer”. You will receive a personal token after creating it.</p>
+      <form id="create" class="flex flex-col gap-3 sm:flex-row"><label class="sr-only" for="name">Node name</label><input id="name" name="name" class="min-w-0 flex-1" maxlength="100" required placeholder="Node name"><button type="submit" class="button">Create node +</button></form>
+    </section>
+    <div id="nodes" class="grid gap-4" aria-live="polite"><p class="muted">Loading nodes…</p></div>
+    <p class="muted mt-8 text-xs leading-relaxed">A node is removed from the schedule after 9 minutes without a heartbeat. Its token and queue are kept.</p>
+    {% endif %}
+    <p id="notice" class="notice mt-6 hidden" role="status"></p>
+    <section id="token-panel" class="panel mt-8 hidden p-6" aria-labelledby="token-title">
+      <p class="eyebrow mb-3">Access ready</p><h2 id="token-title" class="mb-3 text-xl font-semibold">Save your configuration</h2>
+      <p class="muted mb-5 text-sm leading-relaxed">This token is shown only once. Add this block to your local .env and set your NODE_MIN_DATE. Your visa account password stays on your computer.</p>
+      <label class="sr-only" for="configuration">Node configuration</label><textarea id="configuration" readonly rows="6" spellcheck="false" class="w-full font-mono text-xs"></textarea>
+      <div class="mt-4 flex flex-wrap gap-3"><button id="copy" class="button">Copy configuration</button><button id="hide-token" class="button secondary">Saved, hide token</button></div>
+    </section>
+  </main>
+</body></html>

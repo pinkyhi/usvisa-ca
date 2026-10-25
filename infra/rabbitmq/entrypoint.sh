@@ -1,0 +1,5 @@
+#!/bin/bash
+set -e
+export RABBITMQ_DEFAULT_USER="${RABBITMQ_DEFAULT_USER:-${BROKER_ADMIN_USER:?Configure BROKER_ADMIN_USER}}"
+export RABBITMQ_DEFAULT_PASS="${RABBITMQ_DEFAULT_PASS:-${BROKER_ADMIN_PASSWORD:?Configure BROKER_ADMIN_PASSWORD}}"
+exec /usr/local/bin/docker-entrypoint.sh "$@"

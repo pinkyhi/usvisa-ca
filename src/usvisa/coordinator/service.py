@@ -1,0 +1,151 @@
+"""Single-group Coordinator core. No network, account cookies or booking code."""
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from uuid import UUID, uuid4
+
+from usvisa.protocol.messages import (
+    CLOCK_SKEW_SECONDS, FINDING_TTL_SECONDS, HEARTBEAT_TTL_SECONDS, INTERVAL_SECONDS,
+    PRESENCE_SECONDS, Error, GroupConfig, Heartbeat, Message, ScheduleUpdated,
+    SlotsAvailable, SlotsFound, utc,
+)
+
+from .repository import NodeRecord, Repository, ScheduleState, UnitOfWork
+from .scheduling import assign_phases
+
+
+@dataclass(frozen=True)
+class ProcessingResult:
+    status: str
+    reason: str | None = None
+
+
+class Coordinator:
+    def __init__(self, repository: Repository, config: GroupConfig, *, now: datetime):
+        self.repository = repository
+        self.config = config
+        # Startup expires persisted presence rather than treating every restart as
+        # a fresh group. Unchanged live state keeps the same UUID and revision.
+        with repository.transaction() as work:
+            work.initialize(config)
+            self._reconcile(work, utc(now))
+
+    def _snapshot(self, work: UnitOfWork, node: NodeRecord, now: datetime,
+                  in_reply_to: UUID | None = None) -> None:
+        state = work.schedule()
+        message = Message.create(ScheduleUpdated(
+            node.node_id, state.schedule_version, state.revision, node.start_at,
+            INTERVAL_SECONDS, state.report_before, state.config), sent_at=now, in_reply_to=in_reply_to)
+        work.enqueue(node.node_id, "visa.control", message)
+
+    def _reconcile(self, work: UnitOfWork, now: datetime) -> bool:
+        work.expire_members(now - timedelta(seconds=PRESENCE_SECONDS))
+        nodes = work.nodes()
+        active = {node.node_id: node for node in nodes if node.active}
+        previous = {node.node_id: node.start_at for node in nodes if node.start_at is not None}
+        state = work.schedule()
+        report_before = max((node.min_date for node in active.values()), default=None)
+        membership_changed = active.keys() != previous.keys()
+        changed = membership_changed or state.report_before != report_before or state.config != self.config
+        if changed:
+            assignments = assign_phases(set(active), previous, now=now) if membership_changed else previous
+            state = ScheduleState(uuid4(), state.revision + 1, self.config, report_before)
+            work.save_schedule(state, assignments)
+            for node in work.nodes():
+                if node.active:
+                    self._snapshot(work, node, now)
+        work.cancel_outbox(now)
+        return changed
+
+    def expire(self, *, now: datetime) -> bool:
+        with self.repository.transaction() as work:
+            return self._reconcile(work, utc(now))
+
+    def reject_invalid(self, *, publisher: str, message_id: UUID, error, now: datetime):
+        """Persist a correlated error only for an identified, ready broker user."""
+        now = utc(now)
+        with self.repository.transaction() as work:
+            source = work.publisher(publisher)
+            if source is None or source.lifecycle != "ready" or work.seen(source.node_id, message_id):
+                return
+            rejected = Message.create(Error(error.code, str(error)), sent_at=now, message_id=message_id)
+            result = self._reject(work, source, rejected, now, error.code, str(error))
+            work.record(source.node_id, rejected, result.status, result.reason, now)
+
+    def revoke(self, node_id: UUID, *, now: datetime) -> bool:
+        """Local state change; provisioning adapter also blocks the broker user."""
+        with self.repository.transaction() as work:
+            if work.node(node_id) is None:
+                raise ValueError("Unknown node")
+            work.revoke(node_id)
+            return self._reconcile(work, utc(now))
+
+    def handle(self, message: Message, *, publisher: str, now: datetime) -> ProcessingResult:
+        """Process a validated message from a broker-validated user_id property.
+
+        JSON parsing and AMQP metadata checks happen in the transport adapter.
+        Never pass a username supplied inside JSON as publisher.
+        """
+        now = utc(now)
+        with self.repository.transaction() as work:
+            source = work.publisher(publisher)
+            if source is None or source.lifecycle != "ready":
+                # No reply can be routed to an unprovisioned/revoked account.
+                return ProcessingResult("rejected", "NODE_REVOKED")
+            if work.seen(source.node_id, message.message_id):
+                return ProcessingResult("duplicate")
+            if not isinstance(message.data, (Heartbeat, SlotsFound)):
+                result = self._reject(work, source, message, now, "INVALID_MESSAGE", "Expected a node command")
+            elif message.data.node_id != source.node_id:
+                result = self._reject(work, source, message, now, "NODE_ID_MISMATCH",
+                                      "Command identity does not match the authenticated publisher")
+            elif isinstance(message.data, Heartbeat):
+                result = self._heartbeat(work, source, message, now)
+            else:
+                result = self._finding(work, source, message, now)
+            work.record(source.node_id, message, result.status, result.reason, now)
+            return result
+
+    def _reject(self, work: UnitOfWork, source: NodeRecord, message: Message, now: datetime,
+                code: str, description: str) -> ProcessingResult:
+        response = Message.create(Error(code, description), sent_at=now, in_reply_to=message.message_id)
+        work.enqueue(source.node_id, "visa.control", response)
+        return ProcessingResult("rejected", code)
+
+    def _heartbeat(self, work: UnitOfWork, source: NodeRecord, message: Message,
+                   now: datetime) -> ProcessingResult:
+        if message.sent_at > now + timedelta(seconds=CLOCK_SKEW_SECONDS):
+            return self._reject(work, source, message, now, "INVALID_MESSAGE", "Heartbeat timestamp is in the future")
+        if message.sent_at <= now - timedelta(seconds=HEARTBEAT_TTL_SECONDS):
+            self._reconcile(work, now)
+            return ProcessingResult("ignored", "STALE_HEARTBEAT")
+        if source.last_heartbeat_at is not None and message.sent_at <= source.last_heartbeat_at:
+            self._reconcile(work, now)
+            return ProcessingResult("ignored", "OLDER_HEARTBEAT")
+        data = message.data
+        work.heartbeat(source.node_id, data.min_date, message.sent_at, min(message.sent_at, now))
+        changed = self._reconcile(work, now)
+        if not changed and data.schedule_version != work.schedule().schedule_version:
+            self._snapshot(work, work.node(source.node_id), now, message.message_id)
+        return ProcessingResult("processed")
+
+    def _finding(self, work: UnitOfWork, source: NodeRecord, message: Message,
+                 now: datetime) -> ProcessingResult:
+        data = message.data
+        if (data.observed_at > now + timedelta(seconds=CLOCK_SKEW_SECONDS)
+                or data.observed_at > message.sent_at + timedelta(seconds=CLOCK_SKEW_SECONDS)):
+            return self._reject(work, source, message, now, "INVALID_OBSERVED_AT", "Observation timestamp is in the future")
+        expires_at = data.observed_at + timedelta(seconds=FINDING_TTL_SECONDS)
+        self._reconcile(work, now)
+        if expires_at <= now:
+            return ProcessingResult("ignored", "EXPIRED_FINDING")
+        work.finding(source.node_id, message, expires_at)
+        for recipient in work.nodes():
+            if not recipient.active or recipient.node_id == source.node_id:
+                continue
+            dates = tuple(sorted({day for day in data.dates if day < recipient.min_date}))
+            if dates:
+                event = Message.create(SlotsAvailable(message.message_id, source.node_id,
+                                                       data.observed_at, expires_at, dates), sent_at=now)
+                work.enqueue(recipient.node_id, "visa.slots", event, expires_at)
+        return ProcessingResult("processed")

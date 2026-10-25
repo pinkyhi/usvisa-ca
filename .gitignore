@@ -170,3 +170,13 @@ logs/
 *.log
 
 .booking-state/
+
+# Coordinator runtime state (including WAL and rollback journals)
+.coordinator/
+*.sqlite3
+*.sqlite3-*
+.server.env
+.node-state/
+node_modules/
+artifacts/
+.playwright-mcp/

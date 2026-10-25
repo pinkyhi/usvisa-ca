@@ -17,12 +17,14 @@ node = [
     "webdriver-manager",
     "beautifulsoup4",
 ]
+coordinated = ["websocket-client>=1.8,<2"]
 coordinator = [
-    "aio-pika",
-    "fastapi",
-    "uvicorn",
-    "jinja2",
-    "argon2-cffi",
+    "aio-pika>=9,<10",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "jinja2>=3.1,<4",
+    "argon2-cffi>=23,<26",
+    "httpx>=0.27,<1",
 ]
 
 [project.scripts]
@@ -34,3 +36,6 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 version = {attr = "usvisa.__version__"}
+
+[tool.setuptools.package-data]
+"usvisa.coordinator" = ["templates/*.html", "static/*"]
