@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 import requests
 
-from appointment_client import AppointmentClient
+from usvisa.visa.appointment_client import AppointmentClient
 
 
 logger = logging.getLogger(__name__)

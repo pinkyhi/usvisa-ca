@@ -1,13 +1,12 @@
 import os
 from datetime import date
-from pathlib import Path
 
-from dotenv import load_dotenv
+from usvisa.shared.paths import data_directory, load_environment
 
 
-# Always use the .env beside this file, including when launched from an IDE.
-# Explicit environment variables take precedence over the file.
-load_dotenv(Path(__file__).with_name(".env"))
+# Preserve the checkout .env and state paths after moving into src/.
+# Explicit environment variables continue to take precedence.
+load_environment()
 
 
 def env_bool(name, default):
@@ -20,6 +19,9 @@ def env_bool(name, default):
         return False
     raise ValueError(f"{name} must be true or false")
 
+
+MODE = os.getenv("MODE", "solo").strip().lower()
+DATA_DIR = data_directory()
 
 USER_EMAIL = os.getenv("USER_EMAIL", "")
 USER_PASSWORD = os.getenv("USER_PASSWORD", "")
@@ -56,7 +58,7 @@ TEST_MODE = env_bool("TEST_MODE", True)
 SHOW_GUI = env_bool("SHOW_GUI", False)
 RUN_ONCE = env_bool("RUN_ONCE", False)
 PERSIST_SESSION = env_bool("PERSIST_SESSION", True)
-SESSION_CACHE_DIR = Path(__file__).with_name(".sessions")
+SESSION_CACHE_DIR = DATA_DIR / ".sessions"
 DETACH = env_bool("DETACH", False)
 NEW_SESSION_AFTER_FAILURES = int(os.getenv("NEW_SESSION_AFTER_FAILURES", "5"))
 TIMEOUT = int(os.getenv("TIMEOUT", "10"))
@@ -81,6 +83,8 @@ REQUEST_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 
 
 def validate_settings():
+    if MODE not in {"solo", "coordinated"}:
+        raise ValueError("MODE must be solo or coordinated")
     missing = [name for name in (
         "USER_EMAIL", "USER_PASSWORD", "USER_CONSULATE",
         "EARLIEST_ACCEPTABLE_DATE", "LATEST_ACCEPTABLE_DATE",

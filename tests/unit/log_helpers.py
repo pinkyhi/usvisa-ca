@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import audit
-import reschedule
+from usvisa.shared import audit
+from usvisa.node import solo as reschedule
 
 
 class IsolatedLogsTest(unittest.TestCase):

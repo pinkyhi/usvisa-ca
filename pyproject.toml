@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "usvisa-ca"
+dynamic = ["version"]
+description = "US visa appointment monitoring node and coordinator"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["python-dotenv"]
+
+[project.optional-dependencies]
+node = [
+    "requests",
+    "selenium",
+    "webdriver-manager",
+    "beautifulsoup4",
+]
+coordinator = [
+    "aio-pika",
+    "fastapi",
+    "uvicorn",
+    "jinja2",
+    "argon2-cffi",
+]
+
+[project.scripts]
+usvisa-node = "usvisa.node.app:main"
+usvisa-coordinator = "usvisa.coordinator.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "usvisa.__version__"}

@@ -3,8 +3,8 @@
 import re
 import smtplib
 
-import notifications
-import settings
+from usvisa.notifications import email as notifications
+from usvisa.node import settings
 
 
 def check_gmail():

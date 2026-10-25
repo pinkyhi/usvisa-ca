@@ -3,11 +3,13 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from usvisa.shared.paths import data_directory, load_environment
+
+load_environment()
 
 RUN_ID = uuid.uuid4().hex
-LOG_PATH = Path(__file__).with_name("logs") / "rescheduler.jsonl"
-GUARD_DIR = Path(__file__).with_name(".booking-state")
+LOG_PATH = data_directory() / "logs" / "rescheduler.jsonl"
+GUARD_DIR = data_directory() / ".booking-state"
 
 def event(name, **details):
     record = dict(timestamp=datetime.now(timezone.utc).isoformat(), run_id=RUN_ID,

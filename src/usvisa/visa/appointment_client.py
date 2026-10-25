@@ -2,7 +2,7 @@
 
 import re
 import time as clock
-import audit
+from usvisa.shared import audit
 from dataclasses import dataclass
 from datetime import date, time, datetime, timezone
 from email.utils import parsedate_to_datetime

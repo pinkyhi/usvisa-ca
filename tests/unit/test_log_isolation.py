@@ -2,8 +2,8 @@ import io
 import unittest
 from contextlib import redirect_stdout
 
-import audit
-import reschedule
+from usvisa.shared import audit
+from usvisa.node import solo as reschedule
 from tests.unit.log_helpers import IsolatedLogsTest
 
 

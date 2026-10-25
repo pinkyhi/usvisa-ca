@@ -7,8 +7,8 @@ from tests.unit.log_helpers import IsolatedLogsTest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-import notifications
-import settings
+from usvisa.notifications import email as notifications
+from usvisa.node import settings
 from tests.gmail_check import check_gmail
 
 
@@ -98,7 +98,7 @@ class GmailCheckTests(IsolatedLogsTest):
 
     def test_malformed_message_is_nonfatal_for_appointment_notifications(self):
         with patch.object(settings, "GMAIL_SENDER_NAME", "invalid\nname"), \
-             self.assertLogs("notifications", level="WARNING"):
+             self.assertLogs("usvisa.notifications.email", level="WARNING"):
             self.assertFalse(notifications.send_notification("subject", "body"))
         self.smtp.assert_not_called()
 

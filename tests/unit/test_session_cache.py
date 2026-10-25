@@ -8,11 +8,11 @@ from unittest.mock import MagicMock, Mock, patch
 
 import requests
 
-import reschedule
-from appointment_client import (
+from usvisa.node import solo as reschedule
+from usvisa.visa.appointment_client import (
     AppointmentClient, AuthenticationExpired, BookingNotVerified, BookingResult, PortalError,
 )
-from session_cache import SessionCache
+from usvisa.visa.session_cache import SessionCache
 from tests.unit.test_booking import DAY, NoNetworkTest, URL
 
 
@@ -85,7 +85,7 @@ class SessionCacheTests(NoNetworkTest):
 
     def test_corrupt_file_falls_back_without_logging_its_contents(self):
         self.cache.path.write_text("corrupt-private-cookie-value", encoding="utf-8")
-        with self.assertLogs("session_cache", level="WARNING") as logs:
+        with self.assertLogs("usvisa.visa.session_cache", level="WARNING") as logs:
             self.assertIsNone(self.cache.load(95, "Vancouver"))
         self.assertNotIn("corrupt-private-cookie-value", " ".join(logs.output))
 
@@ -98,15 +98,15 @@ class SessionCacheTests(NoNetworkTest):
             {"version": 999},
             {"cookies": [{"name": "malformed"}]},
         ):
-            with self.subTest(changes=changes), self.assertLogs("session_cache", level="WARNING"):
+            with self.subTest(changes=changes), self.assertLogs("usvisa.visa.session_cache", level="WARNING"):
                 self.cache.path.write_text(json.dumps({**original, **changes}), encoding="utf-8")
                 self.assertIsNone(self.cache.load(95, "Vancouver"))
 
     def test_failed_atomic_write_keeps_previous_file_and_removes_temporary_file(self):
         self.cache.save(self.client)
         before = self.cache.path.read_bytes()
-        with patch("session_cache.os.replace", side_effect=OSError("locked")), \
-             self.assertLogs("session_cache", level="WARNING"):
+        with patch("usvisa.visa.session_cache.os.replace", side_effect=OSError("locked")), \
+             self.assertLogs("usvisa.visa.session_cache", level="WARNING"):
             self.assertFalse(self.cache.save(self.client))
         self.assertEqual(before, self.cache.path.read_bytes())
         self.assertEqual(list(self.directory.glob("*.tmp")), [])

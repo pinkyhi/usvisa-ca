@@ -6,8 +6,8 @@ from email.utils import format_datetime
 from unittest.mock import Mock, patch
 
 import requests
-import reschedule
-from appointment_client import AppointmentClient, AuthenticationExpired, RateLimited
+from usvisa.node import solo as reschedule
+from usvisa.visa.appointment_client import AppointmentClient, AuthenticationExpired, RateLimited
 
 
 class RateLimitTests(IsolatedLogsTest):

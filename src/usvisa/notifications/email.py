@@ -1,13 +1,13 @@
 """Optional Gmail notifications; a mail failure never changes a booking result."""
 
 import logging
-import audit
+from usvisa.shared import audit
 import smtplib
 import ssl
 from email.message import EmailMessage
 from email.utils import formataddr
 
-import settings
+from usvisa.node import settings
 
 
 def send_notification(subject, text, *, raise_on_error=False):

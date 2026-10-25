@@ -4,7 +4,7 @@ import io
 import json
 import unittest
 from pathlib import Path
-import audit
+from usvisa.shared import audit
 from contextlib import redirect_stdout
 from datetime import date
 from unittest.mock import MagicMock, Mock, patch
@@ -13,10 +13,10 @@ import requests
 from bs4 import BeautifulSoup
 from selenium.common.exceptions import TimeoutException
 
-import notifications
-import reschedule
-import settings
-from appointment_client import (
+from usvisa.notifications import email as notifications
+from usvisa.node import solo as reschedule
+from usvisa.node import settings
+from usvisa.visa.appointment_client import (
     AppointmentClient, AuthenticationExpired, BookingNotVerified, BookingResult,
     PortalError, RateLimited, acceptable_dates, appointment_matches, form_fields,
 )
@@ -431,7 +431,7 @@ class NotificationTests(NoNetworkTest):
             connection.starttls.assert_called_once()
             connection.login.assert_called_once_with("sender@example.com", "abcdefghijklmnop")
             connection.send_message.side_effect = notifications.smtplib.SMTPException("offline")
-            with self.assertLogs("notifications", level="WARNING"):
+            with self.assertLogs("usvisa.notifications.email", level="WARNING"):
                 self.assertFalse(notifications.send_notification("subject", "body"))
 
 

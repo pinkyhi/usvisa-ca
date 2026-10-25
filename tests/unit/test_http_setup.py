@@ -4,7 +4,7 @@ from unittest.mock import Mock
 
 import requests
 
-from appointment_client import AppointmentClient, PortalError, AuthenticationExpired, RateLimited
+from usvisa.visa.appointment_client import AppointmentClient, PortalError, AuthenticationExpired, RateLimited
 from tests.unit.test_booking import NoNetworkTest, FORM, URL, response
 
 

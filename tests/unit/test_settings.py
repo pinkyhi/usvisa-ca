@@ -16,7 +16,7 @@ class BackoffSettingsTests(unittest.TestCase):
         }
         environment.update(overrides)
         with patch.dict(os.environ, environment, clear=True), patch("dotenv.load_dotenv"):
-            return runpy.run_path(str(Path(__file__).resolve().parents[2] / "settings.py"))
+            return runpy.run_path(str(Path(__file__).resolve().parents[2] / "src" / "usvisa" / "node" / "settings.py"))
 
     def test_missing_parameters_default_to_zero(self):
         settings = self.load_settings({})
@@ -24,6 +24,12 @@ class BackoffSettingsTests(unittest.TestCase):
         for prefix in ("RATE_LIMIT_BACKOFF",):
             for suffix in ("INITIAL_DELAY", "MAX_DELAY", "MULTIPLIER"):
                 self.assertEqual(settings[f"{prefix}_{suffix}"], 0)
+
+    def test_solo_is_the_default_and_invalid_mode_is_rejected(self):
+        self.assertEqual(self.load_settings({})["MODE"], "solo")
+        settings = self.load_settings({"MODE": "unknown"})
+        with self.assertRaisesRegex(ValueError, "MODE"):
+            settings["validate_settings"]()
 
     def test_zero_blank_or_missing_parameter_disables_validation_of_enabled_limits(self):
         for prefix in ("RATE_LIMIT_BACKOFF",):

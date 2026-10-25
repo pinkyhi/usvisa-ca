@@ -22,7 +22,7 @@ A simple Python script for making US visa interview appointments in Canada
 
 ## Prerequisites
 
-- Python 3.x installed
+- Python 3.11 or newer installed
 - An existing US visa appointment booked on https://ais.usvisa-info.com/en-ca/
 - Gmail account for notifications (optional but recommended)
 
@@ -34,6 +34,8 @@ A simple Python script for making US visa interview appointments in Canada
 ```sh
 pip install -r requirements.txt
 ```
+
+This installs the Node package in editable mode. The standalone installation can also be selected explicitly with `pip install -e ".[node]"`; Coordinator dependencies are separate in `.[coordinator]`.
 
 Supported Consulate locations:
 
@@ -49,7 +51,7 @@ CONSULATES = {
 } # Only Toronto and Vancouver consulates are verified
 ```
 
-Add a new `.env` file to the root of the project, this file will be used to configure parameters for the script. You can use the following parameters:
+Use [.env.example](.env.example) as a template for a new `.env` in the project root. MODE defaults to solo. The existing .env and saved sessions remain in the project root after the package migration. You can use the following parameters:
 
 ```
 USER_EMAIL=""   # The email address for your https://ais.usvisa-info.com/en-ca/niv/users/sign_in account
@@ -160,6 +162,16 @@ Note `detect_and_notify.py` is no longer maintained.
 It may not always be feasible to reschedule an appointment multiple times. Therefore, it's crucial to use `TEST_MODE = True` for testing purposes and ensure the `LATEST_ACCEPTABLE_DATE` is genuinely acceptable to you.
 
 Consulates other than Toronto and Vancouver are not tested.
+
+## Development plan
+
+The [Node and Coordinator plan](docs/coordinated-mode-plan.md) describes the planned coordinated mode, API contracts, token portal, and three connection options: Tailscale, a temporary Cloudflare Tunnel, or Cloudflare Tunnel on your own domain.
+
+The package migration is implemented; the current runnable mode is solo. Coordinated services are under development. The compatible `python reschedule.py` launcher remains available, and an editable installation also provides `usvisa-node --mode solo` and `python -m usvisa.node`.
+
+Application code lives in `src/usvisa`: `node` runs the account worker, `coordinator` owns the server entry point, `visa` contains login and HTTP booking, `notifications` delivers email, and `shared` contains paths and audit. Both application entry points support `--help` without importing browser or broker clients.
+
+The default .env, .sessions, logs and .booking-state locations stay at the checkout root, independent of the working directory. Set USVISA_ENV_FILE to choose a configuration file and USVISA_DATA_DIR to choose a state directory. Relative overrides resolve from the checkout root; installed packages outside a checkout use the launch directory as their default. Existing booking guards must be retained when changing the state directory.
 
 ## Contribution
 
