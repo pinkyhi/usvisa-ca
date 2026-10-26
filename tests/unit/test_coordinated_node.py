@@ -23,6 +23,9 @@ class NodeStateTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
+        audit_path = patch("usvisa.shared.audit.LOG_PATH", Path(self.directory.name) / "audit.jsonl")
+        audit_path.start()
+        self.addCleanup(audit_path.stop)
         self.node_id = uuid4()
         self.state = NodeState(Path(self.directory.name) / "state.sqlite3", self.node_id, GROUP)
         self.addCleanup(lambda: self.state.close())

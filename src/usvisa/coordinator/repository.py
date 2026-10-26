@@ -231,7 +231,7 @@ class Repository:
             self._connection.execute("PRAGMA synchronous = FULL")
             with self.transaction() as work:
                 version = work.connection.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1, 2, 3):
+                if version not in (0, 1, 2, 3, 4):
                     raise ValueError("Unsupported Coordinator database version")
                 if version == 0:
                     for statement in _SCHEMA:
@@ -241,8 +241,10 @@ class Repository:
                         work.connection.execute(statement)
                 if version == 2:
                     work.connection.execute("ALTER TABLE users RENAME COLUMN email TO username")
-                if version < 3:
-                    work.connection.execute("PRAGMA user_version = 3")
+                if version < 4:
+                    from .logs import migrate
+                    migrate(work.connection)
+                    work.connection.execute("PRAGMA user_version = 4")
         except BaseException:
             self._connection.close()
             raise

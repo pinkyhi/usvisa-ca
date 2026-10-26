@@ -96,7 +96,7 @@ class PortalTests(unittest.TestCase):
             self.assertEqual(account["user_id"], owner)
             self.assertEqual(authenticate(migrated, "owner@example.com", "legacy-password", "migration-test")[0], "ok")
             with migrated.transaction() as work:
-                self.assertEqual(work.connection.execute("PRAGMA user_version").fetchone()[0], 3)
+                self.assertEqual(work.connection.execute("PRAGMA user_version").fetchone()[0], 4)
                 self.assertEqual(work.connection.execute("SELECT owner_id FROM portal_nodes WHERE node_id=?",
                                                         (str(node_id),)).fetchone()[0], owner)
                 self.assertEqual(work.connection.execute("PRAGMA foreign_key_check").fetchall(), [])

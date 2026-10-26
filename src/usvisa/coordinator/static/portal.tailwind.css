@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @source "../templates";
 @source "./portal.js";
+@source "./logs.js";
 
 /* tweakcn Claude theme: https://tweakcn.com/r/themes/claude.json (Apache-2.0).
    Theme variables are fixed here once; the compiled stylesheet is shipped. */
@@ -66,8 +67,8 @@
 @layer base {
   body { background: var(--background); color: var(--foreground); font-family: var(--font-sans); }
   header, .panel { border-color: var(--border); }
-  input, textarea { border: 1px solid var(--input); border-radius: .5rem; padding: .75rem 1rem; background: var(--card); color: var(--foreground); }
-  input:focus-visible, textarea:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+  input, textarea, select { border: 1px solid var(--input); border-radius: .5rem; padding: .75rem 1rem; background: var(--card); color: var(--foreground); }
+  input:focus-visible, textarea:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
   button { cursor: pointer; }
   button:disabled { cursor: wait; opacity: .6; }
 }
@@ -81,6 +82,72 @@
   .secondary { background: var(--card); color: var(--foreground); border: 1px solid var(--border); }
   .danger { background: transparent; color: #9b342d; }
   .badge { border: 1px solid var(--border); border-radius: 2rem; padding: .5rem .8rem; color: var(--muted-foreground); font-size: .75rem; }
+  .portal-nav { display: flex; gap: .25rem; }
+  .portal-nav a { padding: .7rem .9rem; border-radius: .5rem; color: var(--muted-foreground); font-size: .875rem; }
+  .portal-nav a[aria-current] { background: var(--secondary); color: var(--foreground); font-weight: 600; }
+  .logs-heading { display: flex; align-items: start; justify-content: space-between; gap: 1.5rem; margin-bottom: 2rem; }
+  .log-toolbar, .log-filters, .log-refresh { display: flex; align-items: end; flex-wrap: wrap; gap: 1rem; }
+  .log-toolbar { justify-content: space-between; margin-bottom: 1.75rem; }
+  .log-filters label, .log-group-section label { display: grid; gap: .5rem; font-size: .75rem; font-weight: 600; }
+  .log-filters select { min-width: 10rem; max-width: 20rem; font-size: .875rem; }
+  .log-refresh { align-items: center; }
+  .log-tabs { display: flex; gap: 1.5rem; border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; }
+  .log-tabs button { padding: .8rem 0; border-bottom: 2px solid transparent; color: var(--muted-foreground); font-size: .875rem; }
+  .log-tabs [aria-selected=true] { color: var(--primary); border-color: var(--primary); font-weight: 600; }
+  .log-group-section { padding: 1.25rem 1.5rem; display: flex; align-items: center; gap: 1.5rem; margin-bottom: 1.5rem; }
+  .log-stats { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .log-stats > div { padding: 1.25rem 1.5rem; }
+  .log-stat { font-size: 1.8rem; font-weight: 600; letter-spacing: -.04em; margin-top: .75rem; line-height: 1.3; }
+  .log-stat-small { font-size: 1rem; letter-spacing: -.01em; line-height: 2.34; }
+  .log-chart-panel, .log-list-panel { padding: 1.5rem; margin-bottom: 1.5rem; }
+  .log-section-heading { display: flex; align-items: start; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; }
+  .log-legend { display: flex; flex-wrap: wrap; gap: .9rem; font-size: .65rem; color: var(--muted-foreground); }
+  .log-legend span { display: flex; align-items: center; gap: .35rem; }
+  .dot { width: .45rem; height: .45rem; border-radius: 50%; display: inline-block; }
+  .slots { fill: #29745d; background: #29745d; }
+  .empty { fill: #999b97; background: #999b97; }
+  .warning { fill: #b37d24; background: #b37d24; }
+  .error { fill: #b13c38; background: #b13c38; }
+  .log-chart { overflow-x: auto; }
+  .log-chart svg { display: block; width: 100%; min-width: 620px; }
+  .chart-grid { stroke: var(--border); stroke-dasharray: 3 5; }
+  .chart-lane { stroke: var(--border); opacity: .5; }
+  .chart-label { fill: var(--muted-foreground); font-size: 13px; }
+  .chart-node { fill: var(--foreground); font-size: 14px; }
+  .chart-dot { cursor: pointer; stroke: var(--card); stroke-width: 1.2; }
+  .chart-dot:hover, .chart-dot:focus { stroke: var(--foreground); stroke-width: 2.5; outline: none; }
+  .log-row { display: block; width: 100%; text-align: left; padding: 1.1rem 0; border-top: 1px solid var(--border); }
+  .log-row:hover { background: var(--muted); }
+  .log-row-heading, .log-row-meta { display: flex; justify-content: space-between; flex-wrap: wrap; gap: .5rem; }
+  .log-row-meta { justify-content: start; align-items: center; margin-top: .5rem; }
+  .log-summary { margin-top: .5rem; overflow-wrap: anywhere; }
+  .log-level { font-size: .6rem; letter-spacing: .07em; font-weight: 650; color: var(--muted-foreground); }
+  .log-level.error { color: #a1302e; background: transparent; }
+  .log-level.warning { color: #80590f; background: transparent; }
+  .log-tooltip { position: fixed; z-index: 50; width: 330px; max-width: calc(100vw - 16px); padding: 1rem; border: 1px solid var(--border); border-radius: .75rem; background: var(--popover); box-shadow: var(--shadow-lg); font-size: .75rem; pointer-events: none; }
+  .log-tooltip p { margin-top: .4rem; }
+  .log-tooltip pre { margin: .75rem 0; max-height: 180px; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; font-size: .65rem; }
+  .log-dialog { width: min(900px, calc(100vw - 24px)); max-height: 86vh; margin: auto; padding: 2rem; border: 1px solid var(--border); border-radius: 1rem; background: var(--card); color: var(--foreground); box-shadow: var(--shadow-lg); }
+  .log-dialog::backdrop { background: #21201c77; backdrop-filter: blur(3px); }
+  .log-dialog #log-detail-meta { overflow-wrap: anywhere; }
+  .log-trace { margin-top: 2rem; }
+  .trace-step { padding: 0 0 1.75rem 1.25rem; border-left: 2px solid var(--border); }
+  .trace-heading { display: flex; justify-content: space-between; gap: .5rem; flex-wrap: wrap; font-size: .875rem; margin-bottom: .5rem; }
+  .trace-step pre { margin-top: .75rem; padding: 1rem; background: var(--muted); border-radius: .5rem; font-size: .75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .trace-data { margin-top: .75rem; }
+  .trace-data summary { cursor: pointer; color: var(--primary); font-size: .75rem; padding: .4rem 0; }
+  .trace-data summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+  @media (max-width: 680px) {
+    .logs-heading { flex-wrap: wrap; }
+    .log-filters { width: 100%; }
+    .log-filters label { flex: 1; min-width: 0; }
+    .log-filters select { min-width: 0; width: 100%; }
+    .log-stats { grid-template-columns: repeat(2,minmax(0,1fr)); }
+    .log-stats > div:last-child { grid-column: 1 / -1; }
+    .log-chart-panel, .log-list-panel, .log-stats > div { padding: 1rem; }
+    .log-group-section { flex-wrap: wrap; }
+    .log-dialog { padding: 1.25rem; }
+  }
   .empty-state { padding: 3rem 2rem; text-align: center; border: 1px dashed var(--border); border-radius: .875rem; color: var(--muted-foreground); line-height: 1.7; }
   .notice { padding: 1rem; border-radius: .5rem; background: var(--muted); font-size: .875rem; }
   .notice[data-error=true] { color: #9b342d; background: #fff0ed; }

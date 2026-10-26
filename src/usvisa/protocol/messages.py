@@ -9,6 +9,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import ClassVar
 from uuid import UUID, uuid4
 
+from usvisa.shared.logdata import safe_details
+
 
 INTERVAL_SECONDS = 180
 HEARTBEAT_SECONDS = 30
@@ -63,6 +65,36 @@ class Heartbeat:
     node_id: UUID
     min_date: date
     schedule_version: UUID | None
+    logging_version: UUID | None = None
+    supports_logging: bool = False
+
+
+@dataclass(frozen=True)
+class NodeConfig:
+    TYPE: ClassVar[str] = "node.config"
+    node_id: UUID
+    config_version: UUID
+    verbose: bool
+    log_groups: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LogEntry:
+    event_id: UUID
+    occurred_at: datetime
+    category: str
+    level: str
+    event: str
+    trace_id: UUID | None
+    log_group: str | None
+    details: dict
+
+
+@dataclass(frozen=True)
+class NodeLogs:
+    TYPE: ClassVar[str] = "node.logs"
+    node_id: UUID
+    entries: tuple[LogEntry, ...]
 
 
 @dataclass(frozen=True)
@@ -102,13 +134,25 @@ class Error:
     message: str
 
 
-Payload = Heartbeat | ScheduleUpdated | SlotsFound | SlotsAvailable | Error
+Payload = Heartbeat | NodeConfig | NodeLogs | ScheduleUpdated | SlotsFound | SlotsAvailable | Error
 
 
 def _payload_dict(data: Payload) -> dict:
     if isinstance(data, Heartbeat):
-        return {"nodeId": str(data.node_id), "minDate": data.min_date.isoformat(),
-                "scheduleVersion": str(data.schedule_version) if data.schedule_version else None}
+        result = {"nodeId": str(data.node_id), "minDate": data.min_date.isoformat(),
+                  "scheduleVersion": str(data.schedule_version) if data.schedule_version else None}
+        if data.supports_logging:
+            result["loggingVersion"] = str(data.logging_version) if data.logging_version else None
+        return result
+    if isinstance(data, NodeConfig):
+        return {"nodeId": str(data.node_id), "configVersion": str(data.config_version),
+                "verbose": data.verbose, "logGroups": list(data.log_groups)}
+    if isinstance(data, NodeLogs):
+        return {"nodeId": str(data.node_id), "entries": [
+            {"eventId": str(entry.event_id), "occurredAt": timestamp(entry.occurred_at),
+             "category": entry.category, "level": entry.level, "event": entry.event,
+             "traceId": str(entry.trace_id) if entry.trace_id else None,
+             "logGroup": entry.log_group, "details": entry.details} for entry in data.entries]}
     if isinstance(data, ScheduleUpdated):
         return {"nodeId": str(data.node_id), "scheduleVersion": str(data.schedule_version),
                 "revision": data.revision, "startAt": timestamp(data.start_at),
@@ -240,10 +284,35 @@ def parse_message(body: str | bytes) -> Message:
     data = value["data"]
     kind = value["type"]
     if kind == Heartbeat.TYPE:
-        data = _fields(data, {"nodeId", "minDate", "scheduleVersion"})
+        data = _fields(data, {"nodeId", "minDate", "scheduleVersion"}, {"loggingVersion"})
         payload = Heartbeat(_uuid(data["nodeId"]), _day(data["minDate"], "INVALID_MIN_DATE"),
                             _uuid(data["scheduleVersion"], "INVALID_SCHEDULE_VERSION")
-                            if data["scheduleVersion"] is not None else None)
+                            if data["scheduleVersion"] is not None else None,
+                            _uuid(data["loggingVersion"]) if data.get("loggingVersion") is not None else None,
+                            "loggingVersion" in data)
+    elif kind == NodeConfig.TYPE:
+        data = _fields(data, {"nodeId", "configVersion", "verbose", "logGroups"})
+        if type(data["verbose"]) is not bool or type(data["logGroups"]) is not list:
+            _invalid("Invalid logging configuration")
+        if any(group != "reschedule" for group in data["logGroups"]) or len(data["logGroups"]) > 1:
+            _invalid("Unsupported log group")
+        payload = NodeConfig(_uuid(data["nodeId"]), _uuid(data["configVersion"]), data["verbose"], tuple(data["logGroups"]))
+    elif kind == NodeLogs.TYPE:
+        data = _fields(data, {"nodeId", "entries"})
+        if type(data["entries"]) is not list or not 1 <= len(data["entries"]) <= 25:
+            _invalid("Expected 1 to 25 log entries")
+        entries = []
+        for item in data["entries"]:
+            item = _fields(item, {"eventId", "occurredAt", "category", "level", "event", "traceId", "logGroup", "details"})
+            if (item["category"] not in ("poll", "reschedule", "error")
+                    or item["level"] not in ("info", "warning", "error")
+                    or not isinstance(item["event"], str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", item["event"])
+                    or item["logGroup"] not in (None, "reschedule") or type(item["details"]) is not dict):
+                _invalid("Invalid log entry")
+            entries.append(LogEntry(_uuid(item["eventId"]), _moment(item["occurredAt"]), item["category"],
+                                    item["level"], item["event"], _uuid(item["traceId"]) if item["traceId"] is not None else None,
+                                    item["logGroup"], safe_details(item["details"])))
+        payload = NodeLogs(_uuid(data["nodeId"]), tuple(entries))
     elif kind == ScheduleUpdated.TYPE:
         data = _fields(data, {"nodeId", "scheduleVersion", "revision", "startAt",
                               "intervalSeconds", "reportBefore", "config"})

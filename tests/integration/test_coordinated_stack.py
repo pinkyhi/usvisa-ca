@@ -22,7 +22,7 @@ import httpx
 import websocket
 
 from usvisa.node.state import NodeState
-from usvisa.protocol.messages import GroupConfig, Message, SlotsFound
+from usvisa.protocol.messages import GroupConfig, LogEntry, Message, NodeLogs, SlotsFound
 from usvisa.transport.stomp import Decoder, encode
 from usvisa.transport.webstomp import WebStomp, parse_token
 
@@ -122,6 +122,31 @@ class CoordinatedStackTests(unittest.TestCase):
         until(lambda: states[0].snapshot().data.schedule_version == states[1].snapshot().data.schedule_version)
         self.assertEqual(abs((states[0].snapshot().data.start_at - states[1].snapshot().data.start_at).total_seconds()), 90)
         self.assertEqual(states[0].snapshot().data.report_before, date(2027, 12, 1))
+
+        # Updated peers get logging policy through their existing personal inbox.
+        # Telemetry uses durable SEND receipts and is browsable only by its owner.
+        until(lambda: all(state.logging_config() is not None for state in states))
+        observed, trace = datetime.now(timezone.utc), uuid4()
+        entries = (
+            LogEntry(uuid4(), observed, "poll", "info", "poll_completed", trace, None,
+                     {"dates": ["2027-11-15"], "count": 1, "status": "success"}),
+            LogEntry(uuid4(), observed, "reschedule", "warning", "rate_limited", trace, "reschedule",
+                     {"status": 429, "endpoint": "/appointment/times/95.json"}),
+            LogEntry(uuid4(), observed, "error", "error", "operation_exception", trace, "reschedule",
+                     {"error_type": "PortalError", "message": "Isolated diagnostic fixture"}),
+        )
+        telemetry = Message.create(NodeLogs(UUID(nodes[0]["nodeId"]), entries), sent_at=observed)
+        states[0].add_telemetry(telemetry, observed + timedelta(days=7))
+        until(lambda: not states[0].pending_telemetry(datetime.now(timezone.utc)))
+        activity = until(lambda: client.get("/api/v1/logs").json()["events"])
+        self.assertEqual(activity[0]["nodeId"], nodes[0]["nodeId"])
+        event = client.get(f"/api/v1/logs/{activity[0]['id']}").json()
+        self.assertEqual(len(event["trace"]), 3)
+        self.assertEqual(len(client.get("/api/v1/logs", params={"view": "errors"}).json()["events"]), 1)
+        self.assertEqual(len(client.get("/api/v1/logs", params={"view": "reschedule"}).json()["events"]), 2)
+        states[0].add_telemetry(telemetry, observed + timedelta(days=7))
+        until(lambda: not states[0].pending_telemetry(datetime.now(timezone.utc)))
+        self.assertEqual(client.get("/api/v1/logs").json()["total"], 1)
 
         # Broker must prevent a second connection with the same credentials,
         # including Web STOMP (not just raw AMQP).

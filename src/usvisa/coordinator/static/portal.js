@@ -68,6 +68,7 @@ async function initialize() {
     }); };
   } else {
     const user = await api("/me"); csrf = user.csrfToken; $("account").textContent = user.username;
+    if (document.body.dataset.page === "nodes") {
     await loadNodes();
     $("create").onsubmit = (event) => { event.preventDefault(); busy(event.submitter, async () => {
       // Retain the key if provisioning failed: the next submit resumes the same node.
@@ -75,8 +76,9 @@ async function initialize() {
       const result = await api("/nodes", "POST", {name: $("name").value}, key);
       delete event.target.dataset.key; event.target.reset(); showToken(result); await loadNodes();
     }); };
-    $("logout").onclick = (event) => busy(event.target, async () => { await api("/session", "DELETE"); location.assign("/login"); });
     setInterval(() => loadNodes().catch(() => {}), 30000);
+    }
+    $("logout").onclick = (event) => busy(event.target, async () => { await api("/session", "DELETE"); location.assign("/login"); });
   }
   $("copy").onclick = (event) => busy(event.target, async () => { await navigator.clipboard.writeText($("configuration").value); notice("Configuration copied."); });
   $("hide-token").onclick = () => { $("configuration").value = ""; $("token-panel").classList.add("hidden"); };

@@ -51,6 +51,7 @@ def get_available_dates(client: AppointmentClient):
     except (AuthenticationExpired, RateLimited):
         raise
     except PortalError as error:
+        audit.exception("availability_exception", error)
         log_message(str(error))
         return None
     log_available_dates(dates)

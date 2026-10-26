@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -45,7 +45,8 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
         if instance_lock:
             instance_lock.close()
         raise
-    service = Coordinator(repository, config.group, now=datetime.now(timezone.utc))
+    service = Coordinator(repository, config.group, now=datetime.now(timezone.utc),
+                          verbose=config.verbose, log_groups=config.log_groups)
     admin = admin or BrokerAdmin(config)
     runtime = BrokerRuntime(config, repository, service)
     public_origin = {"value": config.origin}
@@ -244,6 +245,12 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
             return RedirectResponse("/login", status_code=303)
         return templates.TemplateResponse(request=request, name="portal.html", context={"page": "nodes", "city": config.group.city})
 
+    @app.get("/logs", response_class=HTMLResponse)
+    async def logs_page(request: Request):
+        if not session_user(repository, request.cookies.get("visa_session")):
+            return RedirectResponse("/login", status_code=303)
+        return templates.TemplateResponse(request=request, name="portal.html", context={"page": "logs", "city": config.group.city})
+
     @app.get("/api/v1/csrf")
     async def csrf():
         token = secrets.token_urlsafe(32)
@@ -290,7 +297,27 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
     @app.get("/api/v1/me")
     async def me(request: Request):
         user = current(request)
-        return {"userId": user["user_id"], "username": user["username"], "csrfToken": user["csrf"]}
+        return {"userId": user["user_id"], "username": user["username"], "csrfToken": user["csrf"],
+                "canViewAllLogs": user["username"] in config.admin_users}
+
+    @app.get("/api/v1/logs")
+    async def node_logs(request: Request, hours: int = Query(24, ge=1, le=720),
+                        nodeId: UUID | None = None, view: str = Query("activity", pattern="^(activity|errors|reschedule)$"),
+                        before: int | None = Query(None, ge=1), limit: int = Query(100, ge=1, le=200)):
+        from .logs import browse
+        user = current(request)
+        return browse(repository, owner_id=None if user["username"] in config.admin_users else user["user_id"],
+                      hours=hours, node_id=nodeId, view=view, before=before, limit=limit)
+
+    @app.get("/api/v1/logs/{event_id}")
+    async def log_detail(request: Request, event_id: int):
+        from .logs import detail
+        user = current(request)
+        result = detail(repository, event_id,
+                        owner_id=None if user["username"] in config.admin_users else user["user_id"])
+        if result is None:
+            raise HTTPException(404, "Log event not found")
+        return result
 
     @app.get("/api/v1/nodes")
     async def nodes(request: Request):

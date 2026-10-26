@@ -10,7 +10,7 @@ from uuid import UUID
 
 import websocket
 
-from usvisa.protocol.messages import Error, Heartbeat, Message, ProtocolError, ScheduleUpdated, SlotsAvailable, parse_message
+from usvisa.protocol.messages import Error, Heartbeat, Message, NodeConfig, ProtocolError, ScheduleUpdated, SlotsAvailable, parse_message
 from usvisa.shared.network import server_origin, websocket_url
 from .stomp import Decoder, encode
 
@@ -100,12 +100,15 @@ class WebStomp:
                 if subscribed:
                     if tick - sent_hb >= 30:
                         saved = self.state.snapshot()
+                        policy = self.state.logging_config()
                         hb = Message.create(Heartbeat(self.node_id, self.min_date,
-                                                     saved.data.schedule_version if saved else None),
+                                                     saved.data.schedule_version if saved else None,
+                                                     policy.config_version if policy else None, True),
                                             sent_at=datetime.now(timezone.utc))
                         socket.send(encode("SEND", self.headers(hb, 60_000), hb.to_json()))
                         sent_hb = sent_wire = tick
-                    for message, expiry in self.state.pending(datetime.now(timezone.utc)):
+                    tick_now = datetime.now(timezone.utc)
+                    for message, expiry in [*self.state.pending(tick_now), *self.state.pending_telemetry(tick_now)]:
                         receipt = str(message.message_id)
                         if receipt in pending:
                             continue
@@ -164,6 +167,8 @@ class WebStomp:
                             raise
                         socket.send(encode("ACK", {"id": frame.headers["ack"]}))
                         data = message.data
+                        if isinstance(data, NodeConfig):
+                            log.info("Logging configuration received: verbose=%s, logGroups=%s", data.verbose, ",".join(data.log_groups))
                         if isinstance(data, ScheduleUpdated) and (previous is None or data.revision > previous.data.revision):
                             log.info("Schedule received: revision=%s, startAt=%s, interval=%ss, reportBefore=%s",
                                      data.revision, data.start_at.isoformat(), data.interval_seconds, data.report_before)

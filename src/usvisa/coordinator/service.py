@@ -2,12 +2,12 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from usvisa.protocol.messages import (
     CLOCK_SKEW_SECONDS, FINDING_TTL_SECONDS, HEARTBEAT_TTL_SECONDS, INTERVAL_SECONDS,
     PRESENCE_SECONDS, Error, GroupConfig, Heartbeat, Message, ScheduleUpdated,
-    SlotsAvailable, SlotsFound, utc,
+    SlotsAvailable, SlotsFound, NodeConfig, NodeLogs, LogEntry, utc,
 )
 
 from .repository import NodeRecord, Repository, ScheduleState, UnitOfWork
@@ -21,9 +21,11 @@ class ProcessingResult:
 
 
 class Coordinator:
-    def __init__(self, repository: Repository, config: GroupConfig, *, now: datetime):
+    def __init__(self, repository: Repository, config: GroupConfig, *, now: datetime, verbose=False, log_groups=()):
         self.repository = repository
         self.config = config
+        self.verbose, self.log_groups = verbose, tuple(log_groups)
+        self.logging_version = uuid5(NAMESPACE_URL, "usvisa.logging:" + str(verbose) + ",".join(self.log_groups))
         # Startup expires persisted presence rather than treating every restart as
         # a fresh group. Unchanged live state keeps the same UUID and revision.
         with repository.transaction() as work:
@@ -101,13 +103,21 @@ class Coordinator:
                 return ProcessingResult("rejected", "NODE_REVOKED")
             if work.seen(source.node_id, message.message_id):
                 return ProcessingResult("duplicate")
-            if not isinstance(message.data, (Heartbeat, SlotsFound)):
+            if not isinstance(message.data, (Heartbeat, SlotsFound, NodeLogs)):
                 result = self._reject(work, source, message, now, "INVALID_MESSAGE", "Expected a node command")
             elif message.data.node_id != source.node_id:
                 result = self._reject(work, source, message, now, "NODE_ID_MISMATCH",
                                       "Command identity does not match the authenticated publisher")
             elif isinstance(message.data, Heartbeat):
                 result = self._heartbeat(work, source, message, now)
+            elif isinstance(message.data, NodeLogs):
+                from .logs import store
+                if any(entry.occurred_at > now + timedelta(seconds=CLOCK_SKEW_SECONDS) for entry in message.data.entries):
+                    result = self._reject(work, source, message, now, "INVALID_OBSERVED_AT", "Log timestamp is in the future")
+                else:
+                    for entry in message.data.entries:
+                        store(work, source.node_id, entry, now)
+                    result = ProcessingResult("processed")
             else:
                 result = self._finding(work, source, message, now)
             work.record(source.node_id, message, result.status, result.reason, now)
@@ -137,6 +147,9 @@ class Coordinator:
         work.log_event("Heartbeat received", nodeId=source.node_id, messageId=message.message_id,
                        minDate=data.min_date, receivedScheduleVersion=data.schedule_version)
         changed = self._reconcile(work, now)
+        if data.supports_logging and data.logging_version != self.logging_version:
+            work.enqueue(source.node_id, "visa.control", Message.create(
+                NodeConfig(source.node_id, self.logging_version, self.verbose, self.log_groups), sent_at=now))
         if not changed and data.schedule_version != work.schedule().schedule_version:
             self._snapshot(work, work.node(source.node_id), now, message.message_id)
             work.log_event("Schedule resync queued", nodeId=source.node_id,
@@ -154,6 +167,9 @@ class Coordinator:
         if expires_at <= now:
             return ProcessingResult("ignored", "EXPIRED_FINDING")
         work.finding(source.node_id, message, expires_at)
+        from .logs import store
+        store(work, source.node_id, LogEntry(message.message_id, data.observed_at, "finding", "info", "slots_found",
+                                            None, None, {"dates": [day.isoformat() for day in data.dates], "count": len(data.dates)}), now)
         recipients = []
         for recipient in work.nodes():
             if not recipient.active or recipient.node_id == source.node_id:

@@ -102,6 +102,8 @@ def main():
         values.setdefault("BROKER_ADMIN_USER", "provisioner")
         values.setdefault("BROKER_ADMIN_PASSWORD", secrets.token_urlsafe(48))
         values.setdefault("BROKER_PASSWORD", secrets.token_urlsafe(48))
+        values.setdefault("VERBOSE", "false")
+        values.setdefault("LOG_GROUPS", "reschedule")
         if args.profile == "cloudflare_domain" and not values.get("CF_TUNNEL_TOKEN"):
             values["CF_TUNNEL_TOKEN"] = getpass.getpass("Cloudflare tunnel token: ").strip()
             if not values["CF_TUNNEL_TOKEN"]:

@@ -165,6 +165,8 @@ Consulates other than Toronto and Vancouver are not tested.
 
 The [setup guide](docs/coordinated-setup.md) covers the working Node/Coordinator system and all three connection options: Tailscale, a temporary Cloudflare Tunnel, or Cloudflare Tunnel on your own domain. The [architecture and API contract](docs/coordinated-mode-plan.md) describe the protocol and delivery guarantees.
 
+The portal's **Logs** tab shows availability checks on a per-node timeline, serious exceptions, and complete **Reschedule** traces. Set server-side `VERBOSE=true` to collect every poll and `LOG_GROUPS=reschedule` to collect booking diagnostics. Unexpected exceptions are forwarded regardless of those flags; expected HTTP 429 retries are excluded from serious errors. Updated nodes receive the policy automatically through their existing personal queue. See the setup guide for rollout, access and storage details.
+
 Both `solo` and `coordinated` monitoring modes are implemented. Solo remains the default. The compatible `python reschedule.py` launcher remains available, and an editable installation also provides `usvisa-node --mode solo`, `usvisa-node --mode coordinated`, and `python -m usvisa.node`.
 
 To try the server without your own domain (Docker required):

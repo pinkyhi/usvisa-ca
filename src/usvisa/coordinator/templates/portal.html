@@ -4,11 +4,12 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Visa · Coordinator</title>
   <link rel="stylesheet" href="/static/styles.css"><script src="/static/portal.js" defer></script>
+  {% if page == 'logs' %}<script src="/static/logs.js" defer></script>{% endif %}
 </head>
 <body data-page="{{ page }}" data-city="{{ city }}" class="min-h-screen">
-  <header class="border-b px-6 py-5 sm:px-10"><div class="mx-auto flex max-w-5xl items-center justify-between gap-4">
+  <header class="border-b px-6 py-5 sm:px-10"><div class="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-4">
     <a href="/" class="flex items-center gap-3 font-semibold"><span class="brand-mark" aria-hidden="true">V</span> Visa <span class="font-normal muted">/ Coordinator</span></a>
-    {% if page == 'nodes' %}<button id="logout" class="button secondary text-sm">Sign out</button>{% endif %}
+    {% if page != 'login' %}<div class="flex items-center gap-3"><nav class="portal-nav" aria-label="Workspace"><a href="/" {% if page == 'nodes' %}aria-current="page"{% endif %}>Nodes</a><a href="/logs" {% if page == 'logs' %}aria-current="page"{% endif %}>Logs</a></nav><button id="logout" class="button secondary text-sm">Sign out</button></div>{% endif %}
   </div></header>
   <main class="mx-auto max-w-5xl px-6 py-12 sm:px-10 sm:py-16">
     {% if page == 'login' %}
@@ -22,6 +23,16 @@
         <p class="muted text-xs leading-relaxed">The server owner creates your account.</p>
       </form>
     </div>
+    {% elif page == 'logs' %}
+    <div class="logs-heading"><div><p class="eyebrow mb-3">Workspace / diagnostics</p><h1 class="text-4xl font-semibold tracking-tight">Logs</h1><p class="muted mt-3 leading-relaxed">Availability checks and the complete path to an appointment.</p><p id="account" class="muted mt-3 text-sm">Loading account…</p></div><span id="log-scope" class="badge">Your nodes</span></div>
+    <div class="log-toolbar"><div class="log-filters"><label>Node<select id="log-node"><option value="">All nodes</option></select></label><label>Time range<select id="log-hours"><option value="1">Last hour</option><option value="6">Last 6 hours</option><option value="24" selected>Last 24 hours</option><option value="168">Last 7 days</option><option value="720">Last 30 days</option></select></label></div><div class="log-refresh"><span id="log-updated" class="muted text-xs">Refreshes every 30s</span><button id="log-refresh" class="button secondary text-sm">Refresh</button></div></div>
+    <div class="log-tabs" role="tablist" aria-label="Log views"><button role="tab" aria-selected="true" data-log-view="activity">Activity</button><button role="tab" aria-selected="false" data-log-view="errors">Errors</button><button role="tab" aria-selected="false" data-log-view="reschedule">Log groups</button></div>
+    <section id="log-group-section" class="panel log-group-section hidden"><label for="log-group">Log group<select id="log-group"><option value="reschedule">Reschedule</option></select></label><p class="muted text-sm">Follow the dates response, filtering, available times, booking attempt, and verification in one trace.</p></section>
+    <div class="log-stats"><div class="panel"><p class="muted text-xs">Events in range</p><p id="log-total" class="log-stat">—</p></div><div class="panel"><p class="muted text-xs">Nodes with events</p><p id="log-node-count" class="log-stat">—</p></div><div class="panel"><p class="muted text-xs">Latest event · your local time</p><p id="log-latest" class="log-stat log-stat-small">—</p></div></div>
+    <section id="log-chart-panel" class="panel log-chart-panel"><div class="log-section-heading"><div><h2 id="log-chart-title" class="text-lg font-semibold">Activity timeline</h2><p id="log-chart-hint" class="muted mt-2 text-sm">Hover for details. Select a point to inspect its trace.</p></div><div class="log-legend"><span><i class="dot slots"></i>Slots</span><span><i class="dot empty"></i>Empty</span><span><i class="dot warning"></i>Expected retry</span><span><i class="dot error"></i>Error</span></div></div><div id="log-chart" class="log-chart" aria-live="polite"><p class="empty-state">Loading activity…</p></div><p id="log-chart-note" class="muted mt-3 text-xs"></p></section>
+    <section class="panel log-list-panel"><div class="log-section-heading"><h2 id="log-list-title" class="text-lg font-semibold">Event log</h2><span class="muted text-xs">Select an event for full details</span></div><div id="log-list" aria-live="polite"><p class="empty-state">Loading events…</p></div><button id="log-more" class="button secondary hidden">Load older events</button></section>
+    <div id="log-tooltip" class="log-tooltip hidden" role="tooltip"></div>
+    <dialog id="log-detail" class="log-dialog"><div class="log-section-heading"><div><p class="eyebrow mb-3">Event details</p><h2 id="log-detail-title" class="text-xl font-semibold">Trace</h2></div><button id="log-detail-close" class="button secondary text-sm" aria-label="Close event details">Close</button></div><p id="log-detail-meta" class="muted text-sm"></p><div id="log-trace" class="log-trace"></div></dialog>
     {% else %}
     <div class="mb-10 flex flex-wrap items-end justify-between gap-5">
       <div><p class="eyebrow mb-3">Workspace</p><h1 class="text-4xl font-semibold tracking-tight">My nodes</h1><p id="account" class="muted mt-3">Loading account…</p></div>

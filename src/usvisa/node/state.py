@@ -5,7 +5,7 @@ import threading
 from contextlib import contextmanager
 from pathlib import Path
 
-from usvisa.protocol.messages import Error, ProtocolError, ScheduleUpdated, SlotsAvailable, parse_message
+from usvisa.protocol.messages import Error, NodeConfig, ProtocolError, ScheduleUpdated, SlotsAvailable, parse_message
 from usvisa.shared.locking import InstanceLock as InstanceLock
 
 
@@ -24,6 +24,7 @@ class NodeState:
             db.execute("CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, body TEXT NOT NULL, "
                        "expires REAL NOT NULL, status TEXT NOT NULL DEFAULT 'pending')")
             db.execute("CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY, body TEXT NOT NULL, expires REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS telemetry_outbox(id TEXT PRIMARY KEY, body TEXT NOT NULL, expires REAL NOT NULL)")
             db.execute("UPDATE tasks SET status='pending' WHERE status='running'")
         saved = self.snapshot()
         if saved and (saved.data.node_id != node_id or saved.data.config != config):
@@ -58,12 +59,20 @@ class NodeState:
         body = self.get("schedule")
         return parse_message(body) if body else None
 
+    def logging_config(self):
+        body = self.get("logging_config")
+        return parse_message(body).data if body else None
+
     def accept(self, message, *, now):
         data = message.data
         with self.transaction() as db:
             if db.execute("SELECT 1 FROM inbox WHERE id=?", (str(message.message_id),)).fetchone():
                 return "duplicate"
-            if isinstance(data, ScheduleUpdated):
+            if isinstance(data, NodeConfig):
+                if data.node_id != self.node_id:
+                    raise ProtocolError("INVALID_MESSAGE", "Logging configuration identity differs")
+                db.execute("INSERT OR REPLACE INTO meta VALUES('logging_config', ?)", (json.dumps(message.to_json()),))
+            elif isinstance(data, ScheduleUpdated):
                 if data.node_id != self.node_id or data.config != self.config:
                     raise ProtocolError("INVALID_MESSAGE", "Schedule identity or consulate differs from local configuration")
                 row = db.execute("SELECT value FROM meta WHERE key='schedule'").fetchone()
@@ -98,6 +107,18 @@ class NodeState:
     def confirmed(self, message_id):
         with self.transaction() as db:
             db.execute("DELETE FROM outbox WHERE id=?", (str(message_id),))
+            db.execute("DELETE FROM telemetry_outbox WHERE id=?", (str(message_id),))
+
+    def add_telemetry(self, message, expires_at):
+        with self.transaction() as db:
+            db.execute("INSERT OR IGNORE INTO telemetry_outbox VALUES(?,?,?)",
+                       (str(message.message_id), message.to_json(), expires_at.timestamp()))
+
+    def pending_telemetry(self, now):
+        with self.transaction() as db:
+            db.execute("DELETE FROM telemetry_outbox WHERE expires<=?", (now.timestamp(),))
+            return [(parse_message(row["body"]), row["expires"]) for row in
+                    db.execute("SELECT * FROM telemetry_outbox ORDER BY rowid LIMIT 10")]
 
     def next_task(self, now):
         with self.transaction() as db:

@@ -322,6 +322,7 @@ class AppointmentClient:
             raise PortalError("Unexpected date entries in availability response") from error
 
     def get_available_times(self, day):
+        audit.event("times_requested", date=day)
         payload = self._json(
             f"{self.appointment_url}/times/{self.facility_id}.json",
             {"date": day.isoformat(), "appointments[expedite]": "false"},
@@ -333,7 +334,9 @@ class AppointmentClient:
             if any(not isinstance(value, str) or not re.fullmatch(r"\d{2}:\d{2}", value)
                    for value in times):
                 raise ValueError
-            return sorted({time.fromisoformat(value).strftime("%H:%M") for value in times})
+            normalized = sorted({time.fromisoformat(value).strftime("%H:%M") for value in times})
+            audit.event("times_response", date=day, times=normalized, count=len(normalized), status=200)
+            return normalized
         except ValueError as error:
             raise PortalError("Unexpected appointment time format") from error
 

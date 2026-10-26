@@ -17,6 +17,7 @@ from . import settings as cfg
 from . import solo
 from .bootstrap import resolve_origin
 from .state import InstanceLock, NodeState
+from .telemetry import Telemetry
 
 
 def now():
@@ -151,6 +152,7 @@ class Worker:
             message = Message.create(SlotsFound(self.state.node_id, observed, useful), sent_at=now())
             self.state.add_finding(message, expires)
 
+    @audit.traced("reschedule", log_group="reschedule", expected=(RateLimited, AuthenticationExpired))
     def try_dates(self, client, dates, *, observed=None, expires=None):
         excluded, result = set(), None
         if self.verified_booking:
@@ -159,6 +161,9 @@ class Worker:
                                      date.fromisoformat(cfg.LATEST_ACCEPTABLE_DATE),
                                      [(date.fromisoformat(start), date.fromisoformat(end))
                                       for start, end in cfg.EXCLUSION_DATE_RANGES])
+        audit.event("availability_filtered", available=dates, candidates=candidates,
+                    earliest=cfg.EARLIEST_ACCEPTABLE_DATE, latest=cfg.LATEST_ACCEPTABLE_DATE,
+                    exclusions=cfg.EXCLUSION_DATE_RANGES, booking_disabled=bool(self.verified_booking))
         try:
             if self.verified_booking:
                 return None
@@ -194,6 +199,7 @@ class Worker:
             self.notify(result)
         return result
 
+    @audit.traced("poll", expected=(RateLimited, AuthenticationExpired))
     def poll(self, client):
         started = time.time()
         self.minimum_monotonic = time.monotonic() + 180
@@ -201,19 +207,33 @@ class Worker:
         count = self.state.get("cycle_checks", 0) + 1
         self.state.set("cycle_checks", count)
         solo.log_message(f"Checking available dates in {cfg.USER_CONSULATE}")
+        dates, status, level = None, "failed", "info"
         try:
             dates = solo.get_available_dates(client)
+            status = "success" if dates is not None else "failed"
             if dates is not None:
                 solo.log_message(f"Check completed: {len(dates)} available date(s)")
                 solo.log_message(f"Earliest: {min(dates).isoformat()}" if dates else "Portal returned empty array")
             else:
                 solo.log_message("Date check failed; will retry at the next scheduled time")
             observed = now()
+            if dates:
+                with audit.context(log_group="reschedule"):
+                    audit.event("availability_response", dates=dates, count=len(dates), earliest=min(dates), status=200)
             result = self.try_dates(client, dates, observed=observed) if dates else None
             if dates is not None:
                 self.backoff.reset()
             return result
+        except RateLimited:
+            status, level = "rate_limited", "warning"
+            raise
+        except AuthenticationExpired:
+            status, level = "session_expired", "warning"
+            raise
         finally:
+            audit.event("poll_completed", dates=dates or [], count=len(dates or []),
+                        earliest=min(dates) if dates else None, status=status, level=level,
+                        duration_ms=round((time.time() - started) * 1000))
             if cfg.DATE_REQUEST_CYCLE_LENGTH and count >= cfg.DATE_REQUEST_CYCLE_LENGTH:
                 self.state.set("cycle_checks", 0)
                 self.state.set("cooldown", max(self.state.get("cooldown", 0), time.time() + cfg.DATE_REQUEST_CYCLE_GAP))
@@ -234,7 +254,7 @@ class Worker:
             task = self.state.next_task(now())
             if task:
                 try:
-                    self.try_dates(client, task.data.dates, expires=task.data.expires_at)
+                    self.shared_task(client, task)
                 except RateLimited as error:
                     self.state.retry_task(task.data.finding_id)
                     self.backoff.wait(error)
@@ -282,7 +302,7 @@ class Worker:
             solo.log_message(f"Automatic booking remains disabled after verified appointment "
                              f"{self.verified_booking['date']} at {self.verified_booking['time']}; monitoring continues")
         while not self.stop.is_set():
-            if self.state.snapshot() is None:
+            if self.state.snapshot() is None or self.state.logging_config() is None:
                 self.stop.wait(.2)
                 continue
             try:
@@ -295,11 +315,17 @@ class Worker:
             except BookingNotVerified:
                 raise
             except (PortalError, solo.WebDriverException) as error:
+                audit.exception("session_exception", error)
                 solo.log_message(f"Session failed ({type(error).__name__})")
                 self.state.set("cooldown", max(self.state.get("cooldown", 0), time.time() + cfg.FAIL_RETRY_DELAY))
                 self.stop.wait(cfg.FAIL_RETRY_DELAY)
         if self.transport.fatal:
             raise ValueError(self.transport.fatal)
+
+    @audit.traced("shared", log_group="reschedule", expected=(RateLimited, AuthenticationExpired))
+    def shared_task(self, client, task):
+        audit.event("shared_slots_received", dates=task.data.dates, finding_id=task.data.finding_id)
+        return self.try_dates(client, task.data.dates, expires=task.data.expires_at)
 
 
 def main(*, check_only=False):
@@ -318,10 +344,11 @@ def main(*, check_only=False):
     except RuntimeError as error:
         solo.log_message(str(error))
         return 2
-    state = transport = None
+    state = transport = unsubscribe = None
     code = 0
     try:
         state = NodeState(directory / "state.sqlite3", node_id, group)
+        unsubscribe = audit.subscribe(Telemetry(state))
         transport = WebStomp(os.environ.get("SERVER_URL", ""), token, min_date, state,
                             allow_local=os.getenv("ALLOW_INSECURE_LOCALHOST", "false").lower() == "true",
                             **({"origin_provider": resolve_origin}
@@ -352,6 +379,7 @@ def main(*, check_only=False):
     except KeyboardInterrupt:
         solo.log_message("Stopped by user")
     except Exception as error:
+        audit.exception("worker_exception", error)
         audit.event("run_failed", error_type=type(error).__name__)
         solo.log_message(str(error) if isinstance(error, (BookingNotVerified, ValueError)) else
                          f"Coordinated worker stopped ({type(error).__name__})")
@@ -366,9 +394,11 @@ def main(*, check_only=False):
         if transport:
             # A finite flush; unconfirmed findings remain durable for next run.
             deadline = time.monotonic() + 5
-            while code == 0 and state and state.pending(now()) and transport.connected.is_set() and time.monotonic() < deadline:
+            while state and (state.pending(now()) or state.pending_telemetry(now())) and transport.connected.is_set() and time.monotonic() < deadline:
                 time.sleep(.1)
             transport.stop()
+        if unsubscribe:
+            unsubscribe()
         if state:
             state.close()
         lock.close()
