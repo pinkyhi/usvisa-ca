@@ -22,7 +22,8 @@ services:
       - ./logs:/data/logs
     shm_size: 512mb
     init: true
-    # A successful booking, RUN_ONCE, or terminal booking ambiguity must stop.
+    # Solo success or terminal ambiguity must stay stopped.
+    # Coordinated success disables booking and keeps monitoring in this process.
     restart: "no"
     stop_grace_period: 30s
   rabbitmq:

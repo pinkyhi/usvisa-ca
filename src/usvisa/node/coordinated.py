@@ -80,8 +80,6 @@ def authenticated_client():
             client.session.close()
             cache.invalidate()
             client = None
-            if cfg.RUN_ONCE:
-                raise
         except BaseException:
             client.session.close()
             raise
@@ -130,6 +128,7 @@ class Worker:
         self.stop = transport.stopping
         self.backoff = Backoff(state, self.stop)
         self.minimum_monotonic = 0
+        self.verified_booking = self.state.get("verified_booking")
 
     def notify(self, result):
         try:
@@ -154,11 +153,15 @@ class Worker:
 
     def try_dates(self, client, dates, *, observed=None, expires=None):
         excluded, result = set(), None
+        if self.verified_booking:
+            excluded.add(date.fromisoformat(self.verified_booking["date"]))
         candidates = acceptable_dates(dates, date.fromisoformat(cfg.EARLIEST_ACCEPTABLE_DATE),
                                      date.fromisoformat(cfg.LATEST_ACCEPTABLE_DATE),
                                      [(date.fromisoformat(start), date.fromisoformat(end))
                                       for start, end in cfg.EXCLUSION_DATE_RANGES])
         try:
+            if self.verified_booking:
+                return None
             for day in candidates:
                 if self.stop.is_set():
                     break
@@ -172,6 +175,13 @@ class Worker:
                 if result:
                     if not result.dry_run:
                         excluded.add(result.date)
+                        # Commit before reporting/email: a restart or notification
+                        # failure must not re-enable automatic booking.
+                        verified = {"date": result.date.isoformat(), "time": result.time}
+                        self.state.set("verified_booking", verified)
+                        self.verified_booking = verified
+                        solo.log_booking_success(result)
+                        solo.log_message("Coordinated monitoring continues; further automatic booking is disabled")
                     break
         finally:
             # Persist before notification/exit, including dates outside our own
@@ -179,7 +189,8 @@ class Worker:
             if observed is not None:
                 self.report(dates, observed, excluded)
         if result:
-            solo.log_message(f"{'TEST' if result.dry_run else 'VERIFIED'}: {result.date} at {result.time}")
+            if result.dry_run:
+                solo.log_message(f"TEST: would book {result.date} at {result.time}; no booking POST was sent")
             self.notify(result)
         return result
 
@@ -223,11 +234,9 @@ class Worker:
             task = self.state.next_task(now())
             if task:
                 try:
-                    result = self.try_dates(client, task.data.dates, expires=task.data.expires_at)
+                    self.try_dates(client, task.data.dates, expires=task.data.expires_at)
                 except RateLimited as error:
                     self.state.retry_task(task.data.finding_id)
-                    if cfg.RUN_ONCE:
-                        raise
                     self.backoff.wait(error)
                 except AuthenticationExpired:
                     self.state.retry_task(task.data.finding_id)
@@ -240,8 +249,6 @@ class Worker:
                     self.state.finish_task(task.data.finding_id)
                 else:
                     self.state.finish_task(task.data.finding_id)
-                    if result:
-                        return result
                 due = None
                 continue
             snapshot = self.state.snapshot()
@@ -261,20 +268,19 @@ class Worker:
                 due = None
                 continue
             try:
-                result = self.poll(client)
+                self.poll(client)
             except RateLimited as error:
-                if cfg.RUN_ONCE:
-                    raise
                 self.backoff.wait(error)
                 due = None
                 continue
-            if result or cfg.RUN_ONCE:
-                return result
             due = None
         if self.transport.fatal:
             raise ValueError(self.transport.fatal)
 
     def run(self):
+        if self.verified_booking:
+            solo.log_message(f"Automatic booking remains disabled after verified appointment "
+                             f"{self.verified_booking['date']} at {self.verified_booking['time']}; monitoring continues")
         while not self.stop.is_set():
             if self.state.snapshot() is None:
                 self.stop.wait(.2)
@@ -283,19 +289,13 @@ class Worker:
                 with authenticated_client() as client:
                     return self.loop(client)
             except AuthenticationExpired:
-                if cfg.RUN_ONCE:
-                    raise
                 solo.log_message("Session expired; signing in again")
             except RateLimited as error:
-                if cfg.RUN_ONCE:
-                    raise
                 self.backoff.wait(error)
             except BookingNotVerified:
                 raise
             except (PortalError, solo.WebDriverException) as error:
                 solo.log_message(f"Session failed ({type(error).__name__})")
-                if cfg.RUN_ONCE:
-                    raise
                 self.state.set("cooldown", max(self.state.get("cooldown", 0), time.time() + cfg.FAIL_RETRY_DELAY))
                 self.stop.wait(cfg.FAIL_RETRY_DELAY)
         if self.transport.fatal:

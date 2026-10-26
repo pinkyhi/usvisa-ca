@@ -309,7 +309,7 @@ class RunnerTests(NoNetworkTest):
             "EXCLUSION_DATE_RANGES": [], "USER_CONSULATE": "Vancouver", "TEST_MODE": True,
             "DATE_REQUEST_DELAY": 0,
             "DATE_REQUEST_CYCLE_LENGTH": 0,
-            "RUN_ONCE": True, "FAIL_RETRY_DELAY": 0,
+            "FAIL_RETRY_DELAY": 0,
             "NEW_SESSION_AFTER_FAILURES": 1,
             "PERSIST_SESSION": False,
         }
@@ -320,22 +320,24 @@ class RunnerTests(NoNetworkTest):
         output.__enter__()
         self.addCleanup(output.__exit__, None, None, None)
 
-    def test_run_once_checks_dates_once_without_waiting(self):
+    def test_empty_and_outside_dates_continue_until_verified_booking(self):
         for dates in ([], [date(2027, 1, 1)]):
             with self.subTest(dates=dates):
                 client = Mock()
-                client.get_available_dates.return_value = dates
-                with patch.object(reschedule, "sleep") as sleep:
-                    self.assertIsNone(reschedule.reschedule(client))
-                client.get_available_dates.assert_called_once()
-                client.book.assert_not_called()
-                sleep.assert_not_called()
+                client.get_available_dates.side_effect = [dates, [DAY]]
+                client.book.return_value = BookingResult(DAY, "08:30", False)
+                with patch.object(reschedule, "TEST_MODE", False), \
+                     patch.object(reschedule, "send_notification"), patch.object(reschedule, "sleep") as sleep:
+                    self.assertFalse(reschedule.reschedule(client).dry_run)
+                self.assertEqual(client.get_available_dates.call_count, 2)
+                client.book.assert_called_once_with(DAY, dry_run=False)
+                sleep.assert_called_once_with(0)
 
     def test_continuous_polling_uses_same_client_every_240_seconds(self):
         client = Mock()
         client.get_available_dates.side_effect = [[date(2027, 1, 1)]] * 7 + [[DAY]]
-        client.book.return_value = BookingResult(DAY, "08:30", True)
-        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=240), \
+        client.book.return_value = BookingResult(DAY, "08:30", False)
+        with patch.multiple(reschedule, TEST_MODE=False, DATE_REQUEST_DELAY=240), \
              patch.object(reschedule, "sleep") as sleep, \
              patch.object(reschedule, "send_notification"):
             self.assertIsNotNone(reschedule.reschedule(client))
@@ -344,19 +346,22 @@ class RunnerTests(NoNetworkTest):
 
     def test_polling_skips_date_without_times_and_does_not_claim_dry_run_success(self):
         client = Mock()
-        client.get_available_dates.return_value = [DAY, date(2026, 11, 13)]
+        client.get_available_dates.side_effect = [[DAY, date(2026, 11, 13)], KeyboardInterrupt()]
         client.book.side_effect = [None, BookingResult(date(2026, 11, 13), "08:30", True)]
-        with patch.object(reschedule, "send_notification", return_value=False) as notify:
-            result = reschedule.reschedule(client)
-        self.assertTrue(result.dry_run)
+        with patch.object(reschedule, "send_notification", return_value=False) as notify, \
+             patch.object(reschedule, "sleep") as sleep:
+            with self.assertRaises(KeyboardInterrupt):
+                reschedule.reschedule(client)
+        self.assertEqual(client.get_available_dates.call_count, 2)
+        sleep.assert_called_once_with(0)
         self.assertTrue(notify.call_args.args[0].startswith("[TEST]"))
         self.assertEqual(client.book.call_count, 2)
 
     def test_cycles_pause_after_five_ordinary_checks_and_reuse_client(self):
         client = Mock()
         client.get_available_dates.side_effect = [[date(2027, 1, 1)]] * 10 + [[DAY]]
-        client.book.return_value = BookingResult(DAY, "08:30", True)
-        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=180,
+        client.book.return_value = BookingResult(DAY, "08:30", False)
+        with patch.multiple(reschedule, TEST_MODE=False, DATE_REQUEST_DELAY=180,
                 DATE_REQUEST_CYCLE_LENGTH=5, DATE_REQUEST_CYCLE_GAP=900), \
              patch.object(reschedule, "sleep") as sleep, \
              patch.object(reschedule, "send_notification"):
@@ -373,6 +378,18 @@ class RunnerTests(NoNetworkTest):
              patch.object(reschedule, "send_notification", return_value=False):
             self.assertFalse(reschedule.reschedule(client).dry_run)
         client.book.assert_called_once_with(DAY, dry_run=False)
+
+    def test_verified_success_is_green_uppercase_and_audit_contains_plain_text(self):
+        result = BookingResult(DAY, "08:30", False)
+        with patch.object(reschedule.audit, "event") as audit_event, patch("builtins.print") as output:
+            reschedule.log_booking_success(result)
+        printed = output.call_args.args[0]
+        self.assertTrue(printed.startswith("\033[1;32m"))
+        self.assertTrue(printed.endswith("\033[0m"))
+        message = audit_event.call_args.kwargs["message"]
+        self.assertEqual(message, message.upper())
+        self.assertIn("BOOKED AND VERIFIED", message)
+        self.assertNotIn("\033", message)
 
     def test_browser_is_closed_before_http_polling_and_http_client_is_closed(self):
         driver = Mock()
@@ -408,8 +425,7 @@ class RunnerTests(NoNetworkTest):
         context = MagicMock()
         client = context.__enter__.return_value
         client.prepare_session.side_effect = [RateLimited(), None]
-        with patch.object(reschedule, "RUN_ONCE", False), \
-             patch.multiple(reschedule, RATE_LIMIT_BACKOFF_INITIAL_DELAY=4,
+        with patch.multiple(reschedule, RATE_LIMIT_BACKOFF_INITIAL_DELAY=4,
                             RATE_LIMIT_BACKOFF_MAX_DELAY=4096, RATE_LIMIT_BACKOFF_MULTIPLIER=2), \
              patch.object(reschedule, "get_chrome_driver", return_value=driver) as browser, \
              patch.object(reschedule, "login") as login, \

@@ -57,7 +57,9 @@ def main(argv=None):
     if args.command == "serve":
         import uvicorn
         from .config import ServerConfig
+        from .observability import configure_logging
         from .portal import create_app
+        configure_logging()
         try:
             config = ServerConfig.from_env(args.database)
         except (ValueError, KeyError) as error:

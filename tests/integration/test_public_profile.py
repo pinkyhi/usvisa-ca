@@ -136,12 +136,21 @@ class PublicProfileTests(unittest.TestCase):
             def fake_session():
                 yield visa
 
+            real_poll = coordinated.Worker.poll
+
+            def stop_after_check(worker, client):
+                result = real_poll(worker, client)
+                until(lambda: not worker.state.pending(datetime.now(timezone.utc)))
+                worker.stop.set()
+                return result
+
             with patch.dict(os.environ, {"NODE_TOKEN": worker_node["token"], "NODE_MIN_DATE": "2027-11-01",
                                          "SERVER_URL": origin}), \
                  patch.multiple(coordinated.cfg, MODE="coordinated", USER_EMAIL="offline@example.test",
-                                USER_PASSWORD="offline-test-only", USER_CONSULATE="Vancouver", RUN_ONCE=True,
+                                USER_PASSWORD="offline-test-only", USER_CONSULATE="Vancouver",
                                 TEST_MODE=True, EXCLUSION_DATE_RANGES=[], EARLIEST_ACCEPTABLE_DATE="2027-11-01", LATEST_ACCEPTABLE_DATE="2027-11-30"), \
                  patch.object(coordinated, "authenticated_client", fake_session), \
+                 patch.object(coordinated.Worker, "poll", stop_after_check), \
                  patch.object(coordinated, "data_directory", return_value=Path(temporary.name)), \
                  patch.object(coordinated, "next_check_at", side_effect=lambda *args: time.time()), \
                  patch.object(coordinated.audit, "LOG_PATH", Path(temporary.name) / "audit.jsonl"), \

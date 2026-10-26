@@ -56,7 +56,6 @@ RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "")
 # A test run logs in and prepares a booking, but never submits the booking POST.
 TEST_MODE = env_bool("TEST_MODE", True)
 SHOW_GUI = env_bool("SHOW_GUI", False)
-RUN_ONCE = env_bool("RUN_ONCE", False)
 PERSIST_SESSION = env_bool("PERSIST_SESSION", True)
 SESSION_CACHE_DIR = DATA_DIR / ".sessions"
 DETACH = env_bool("DETACH", False)

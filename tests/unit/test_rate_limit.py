@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import requests
 from usvisa.node import solo as reschedule
-from usvisa.visa.appointment_client import AppointmentClient, AuthenticationExpired, RateLimited
+from usvisa.visa.appointment_client import AppointmentClient, AuthenticationExpired, BookingResult, RateLimited
 
 
 class RateLimitTests(IsolatedLogsTest):
@@ -57,7 +57,7 @@ class RateLimitTests(IsolatedLogsTest):
             RateLimited(), RateLimited(), RateLimited("1000"), [], RateLimited(), [], KeyboardInterrupt(),
         ]
         with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
-                RUN_ONCE=False, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
+                EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "sleep") as sleep, \
              patch.object(reschedule, "log_message"):
@@ -72,7 +72,6 @@ class RateLimitTests(IsolatedLogsTest):
         client.get_available_dates.side_effect = [[date(2026, 11, 12)]] * 3 + [KeyboardInterrupt()]
         client.book.side_effect = [RateLimited(), RateLimited(), None]
         with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
-                RUN_ONCE=False,
                 EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "sleep") as sleep, \
@@ -83,7 +82,6 @@ class RateLimitTests(IsolatedLogsTest):
 
     def test_backoff_survives_session_boundaries(self):
         with patch.object(reschedule, "validate_settings"), \
-             patch.object(reschedule, "RUN_ONCE", False), \
              patch.object(reschedule, "sleep"), \
              patch.object(reschedule, "log_message"), \
              patch.object(reschedule, "reschedule_with_new_session") as run:
@@ -92,7 +90,7 @@ class RateLimitTests(IsolatedLogsTest):
             def attempt(*, backoff):
                 delays.append(backoff.delay)
                 backoff.wait(RateLimited())
-                return None if len(delays) == 1 else object()
+                return None if len(delays) == 1 else BookingResult(date(2026, 11, 12), "08:30", False)
 
             run.side_effect = attempt
             self.assertEqual(reschedule.main(), 0)
@@ -102,8 +100,7 @@ class RateLimitTests(IsolatedLogsTest):
         client = Mock()
         client.get_available_dates.side_effect = RateLimited()
         with patch.multiple(reschedule, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
-                LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[],
-                RUN_ONCE=False), \
+                LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "validate_settings"), \
              patch.object(reschedule, "log_message"), \
              patch.object(reschedule, "sleep") as sleep, \
@@ -117,23 +114,21 @@ class RateLimitTests(IsolatedLogsTest):
         notify.assert_called_once()
         client.book.assert_not_called()
 
-    def test_expired_session_restarts_only_when_run_once_is_false(self):
-        for run_once in (True, False):
-            with self.subTest(run_once=run_once), \
-                 patch.object(reschedule, "RUN_ONCE", run_once), \
-                 patch.object(reschedule, "validate_settings"), \
-                 patch.object(reschedule, "log_message"), \
-                 patch.object(reschedule, "sleep") as sleep, \
-                 patch.object(reschedule, "reschedule_with_new_session",
-                              side_effect=[AuthenticationExpired("HTTP 401"), object()]) as run:
-                self.assertEqual(reschedule.main(), 1 if run_once else 0)
-                self.assertEqual(run.call_count, 1 if run_once else 2)
-                sleep.assert_not_called()
+    def test_expired_session_restarts_login(self):
+        with patch.object(reschedule, "validate_settings"), \
+             patch.object(reschedule, "log_message"), \
+             patch.object(reschedule, "sleep") as sleep, \
+             patch.object(reschedule, "reschedule_with_new_session",
+                          side_effect=[AuthenticationExpired("HTTP 401"),
+                                       BookingResult(date(2026, 11, 12), "08:30", False)]) as run:
+            self.assertEqual(reschedule.main(), 0)
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_not_called()
 
-    def test_run_once_does_not_retry_or_wait_on_429(self):
+    def test_rate_limit_waits_retry_after_then_resumes_same_client(self):
         client = Mock()
-        client.get_available_dates.side_effect = RateLimited("600")
-        with patch.multiple(reschedule, RUN_ONCE=True,
+        client.get_available_dates.side_effect = [RateLimited("600"), [], KeyboardInterrupt()]
+        with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
                 EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "validate_settings"), \
@@ -141,16 +136,16 @@ class RateLimitTests(IsolatedLogsTest):
              patch.object(reschedule, "sleep") as sleep, \
              patch.object(reschedule, "reschedule_with_new_session") as run:
             run.side_effect = lambda *, backoff: reschedule.reschedule(client, backoff=backoff)
-            self.assertEqual(reschedule.main(), 1)
+            self.assertEqual(reschedule.main(), 0)
         run.assert_called_once()
-        client.get_available_dates.assert_called_once()
-        sleep.assert_not_called()
+        self.assertEqual(client.get_available_dates.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [600, 180])
 
     def test_empty_dates_use_normal_delay_even_after_nonempty_reply(self):
         client = Mock()
         client.get_available_dates.side_effect = ([[]] * 6
             + [[date(2027, 1, 1)], [], KeyboardInterrupt()])
-        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=180,
+        with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
                 EARLIEST_ACCEPTABLE_DATE="2026-11-01", LATEST_ACCEPTABLE_DATE="2026-12-01",
                 EXCLUSION_DATE_RANGES=[]), patch.object(reschedule, "sleep") as sleep, \
                 patch.object(reschedule, "log_message"):
@@ -160,18 +155,19 @@ class RateLimitTests(IsolatedLogsTest):
                          [180] * 8)
         client.book.assert_not_called()
 
-    def test_run_once_does_not_retry_or_wait_on_empty_dates(self):
+    def test_empty_dates_keep_polling_with_normal_delay(self):
         client = Mock()
-        client.get_available_dates.return_value = []
-        with patch.multiple(reschedule, RUN_ONCE=True,
+        client.get_available_dates.side_effect = [[], [], KeyboardInterrupt()]
+        with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
                 EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "sleep") as sleep, \
              patch.object(reschedule, "log_message"):
-            self.assertIsNone(reschedule.reschedule(client))
-        client.get_available_dates.assert_called_once()
+            with self.assertRaises(KeyboardInterrupt):
+                reschedule.reschedule(client)
+        self.assertEqual(client.get_available_dates.call_count, 3)
         client.book.assert_not_called()
-        sleep.assert_not_called()
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [180, 180])
 
     def test_custom_429_backoff_reaches_cap_then_stops(self):
         with patch.multiple(reschedule, RATE_LIMIT_BACKOFF_INITIAL_DELAY=3,
@@ -187,7 +183,7 @@ class RateLimitTests(IsolatedLogsTest):
     def test_empty_dates_respect_cycle_gap(self):
         client = Mock()
         client.get_available_dates.side_effect = [[], [], [], KeyboardInterrupt()]
-        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_CYCLE_LENGTH=1,
+        with patch.multiple(reschedule, DATE_REQUEST_CYCLE_LENGTH=1,
                 DATE_REQUEST_CYCLE_GAP=900, EARLIEST_ACCEPTABLE_DATE="2026-11-01",
                 LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[]), \
              patch.object(reschedule, "sleep") as sleep, patch.object(reschedule, "log_message"):
@@ -214,7 +210,7 @@ class RateLimitTests(IsolatedLogsTest):
         client.get_available_dates.side_effect = [
             RateLimited(), [], RateLimited("600"), [], KeyboardInterrupt(),
         ]
-        with patch.multiple(reschedule, RUN_ONCE=False, DATE_REQUEST_DELAY=180,
+        with patch.multiple(reschedule, DATE_REQUEST_DELAY=180,
                 DATE_REQUEST_CYCLE_LENGTH=2, DATE_REQUEST_CYCLE_GAP=900,
                 RATE_LIMIT_BACKOFF_INITIAL_DELAY=0,
                 EARLIEST_ACCEPTABLE_DATE="2026-11-01", LATEST_ACCEPTABLE_DATE="2026-12-01",

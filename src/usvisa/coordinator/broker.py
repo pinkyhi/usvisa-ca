@@ -8,7 +8,8 @@ from uuid import UUID
 import aio_pika
 import httpx
 
-from usvisa.protocol.messages import ProtocolError, parse_message
+from usvisa.protocol.messages import ProtocolError, ScheduleUpdated, SlotsAvailable, parse_message
+from .observability import event as log_event
 
 
 log = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ class BrokerRuntime:
         await queue.bind(self.exchanges["visa.commands"], "coordinator")
         await queue.consume(self.consume)
         self.ready = True
+        log_event("RabbitMQ connected", status="ready")
         self.tasks = [asyncio.create_task(self.publish_loop()), asyncio.create_task(self.presence_loop())]
 
     async def close(self):
@@ -144,6 +146,14 @@ class BrokerRuntime:
                         expiration=remaining / 1000 if remaining is not None else None),
                         routing_key=entry.routing_key, mandatory=True, timeout=15)
                     self.repository.mark_published(event.message_id)
+                    details = {}
+                    if isinstance(event.data, ScheduleUpdated):
+                        details = {"revision": event.data.revision, "scheduleVersion": event.data.schedule_version,
+                                   "startAt": event.data.start_at, "intervalSeconds": event.data.interval_seconds}
+                    elif isinstance(event.data, SlotsAvailable):
+                        details = {"findingId": event.data.finding_id, "dates": event.data.dates}
+                    log_event("Event published to RabbitMQ", nodeId=entry.node_id, messageId=event.message_id,
+                              eventType=event.type, **details)
             except asyncio.CancelledError:
                 raise
             except Exception as error:

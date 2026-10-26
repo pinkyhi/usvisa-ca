@@ -17,6 +17,7 @@ from pathlib import Path
 from uuid import UUID
 
 from usvisa.protocol.messages import GroupConfig, Message, parse_message, timestamp, utc
+from .observability import event
 
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -83,6 +84,10 @@ class UnitOfWork:
 
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
+        self.events = []
+
+    def log_event(self, name, **fields):
+        self.events.append((name, fields))
 
     def node(self, node_id: UUID) -> NodeRecord | None:
         return _node(self.connection.execute("SELECT * FROM nodes WHERE node_id = ?",
@@ -244,14 +249,18 @@ class Repository:
 
     @contextmanager
     def transaction(self):
+        work = UnitOfWork(self._connection)
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                yield UnitOfWork(self._connection)
+                yield work
                 self._connection.commit()
             except BaseException:
                 self._connection.rollback()
                 raise
+        # Only report state changes after commit; rolled-back work stays silent.
+        for name, fields in work.events:
+            event(name, **fields)
 
     def close(self) -> None:
         with self._lock:

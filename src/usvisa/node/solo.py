@@ -21,10 +21,16 @@ from usvisa.visa.login import get_chrome_driver, login
 AVAILABLE_DATES_LOG_PATH = data_directory() / "logs" / "available_dates.log"
 
 
-def log_message(message: str) -> None:
+def log_message(message: str, *, green=False) -> None:
     audit.event("message", message=message)
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] {message}")
+    line = f"[{timestamp}] {message}"
+    print(f"\033[1;32m{line}\033[0m" if green else line)
+
+
+def log_booking_success(result):
+    log_message((f"APPOINTMENT SUCCESSFULLY BOOKED AND VERIFIED: {result.date} AT {result.time} "
+                 f"IN {USER_CONSULATE}. AUTOMATIC BOOKING STOPPED.").upper(), green=True)
 
 
 def log_available_dates(dates):
@@ -112,20 +118,14 @@ def reschedule(client: AppointmentClient, backoff=None):
         try:
             dates = get_available_dates(client)
         except RateLimited as error:
-            if RUN_ONCE:
-                raise
             wait_for_next_check(error)
             continue
         if dates is None:
-            if RUN_ONCE:
-                return None
             wait_for_next_check()
             continue
         if not dates:
             backoff.reset()
             log_message("Portal returned HTTP 200 with no available dates")
-            if RUN_ONCE:
-                return None
             wait_for_next_check()
             continue
         candidates = acceptable_dates(dates, earliest, latest, exclusions)
@@ -138,8 +138,6 @@ def reschedule(client: AppointmentClient, backoff=None):
             try:
                 result = client.book(day, dry_run=TEST_MODE)
             except RateLimited as error:
-                if RUN_ONCE:
-                    raise
                 wait_for_next_check(error)
                 rate_limited = True
                 break
@@ -161,22 +159,18 @@ def reschedule(client: AppointmentClient, backoff=None):
                     f"Available slot: {result.date} at {result.time}, {USER_CONSULATE}. "
                     "The booking form was prepared, but no appointment was changed.",
                 )
+                break
             else:
-                log_message(
-                    f"VERIFIED: appointment booked for {result.date} at "
-                    f"{result.time} in {USER_CONSULATE}"
-                )
+                log_booking_success(result)
                 send_notification(
                     f"Visa Appointment Rescheduled for {result.date}",
                     f"Your appointment has been verified on the portal for "
                     f"{result.date} at {result.time}, {USER_CONSULATE}.",
                 )
-            return result
+                return result
         if rate_limited:
             continue
         backoff.reset()
-        if RUN_ONCE:
-            return None
         wait_for_next_check()
 
 
@@ -217,8 +211,6 @@ def reschedule_with_new_session(backoff=None):
                 with client:
                     return run_http_session(client, cache, validate_session=True, backoff=backoff)
             except AuthenticationExpired:
-                if RUN_ONCE:
-                    raise
                 log_message("Saved login session expired; logging in again with Selenium")
     driver = get_chrome_driver()
     try:
@@ -245,8 +237,6 @@ def reschedule_with_new_session(backoff=None):
                     client.prepare_session()
                     break
                 except RateLimited as error:
-                    if RUN_ONCE:
-                        raise
                     setup_backoff.wait(error)
             return run_http_session(client, cache, backoff=backoff)
     finally:
@@ -262,22 +252,18 @@ def _main():
         return 2
     log_message(f"Consulate: {USER_CONSULATE}")
     log_message(f"Acceptable dates: {EARLIEST_ACCEPTABLE_DATE} to {LATEST_ACCEPTABLE_DATE}")
-    log_message(f"TEST_MODE={TEST_MODE}; RUN_ONCE={RUN_ONCE}")
+    log_message(f"TEST_MODE={TEST_MODE}")
     gmail_enabled = all((GMAIL_EMAIL, GMAIL_APPLICATION_PWD, RECEIVER_EMAIL))
     log_message(f"Gmail notifications: {'enabled' if gmail_enabled else 'disabled'}")
     backoff = RateLimitBackoff()
     try:
         while True:
             log_message("Preparing authenticated session")
-            session_failed = False
             try:
                 result = reschedule_with_new_session(backoff=backoff)
             except RateLimitExhausted:
                 raise
             except RateLimited as error:
-                if RUN_ONCE:
-                    log_message(str(error))
-                    return 1
                 backoff.wait(error)
                 continue
             except BookingNotVerified as error:
@@ -286,19 +272,13 @@ def _main():
                 return 1
             except AuthenticationExpired as error:
                 log_message(str(error))
-                if RUN_ONCE:
-                    return 1
                 log_message("Session expired; restarting Selenium login")
                 continue
             except (PortalError, WebDriverException) as error:
                 log_message(f"Session failed: {error}")
-                session_failed = True
                 result = None
-            if result is not None:
+            if result is not None and not result.dry_run:
                 return 0
-            if RUN_ONCE:
-                log_message("Single availability check finished without a suitable slot")
-                return 1 if session_failed else 0
             sleep(DATE_REQUEST_DELAY)
     except RateLimitExhausted as error:
         log_message(str(error))
@@ -312,7 +292,7 @@ def _main():
 
 
 def main():
-    audit.event("run_started", test_mode=TEST_MODE, run_once=RUN_ONCE,
+    audit.event("run_started", test_mode=TEST_MODE,
                 consulate=USER_CONSULATE, earliest=EARLIEST_ACCEPTABLE_DATE,
                 latest=LATEST_ACCEPTABLE_DATE)
     try:

@@ -324,12 +324,16 @@ class CoordinatorTests(unittest.TestCase):
     def test_failed_outbox_write_rolls_back_membership_version_and_inbox_together(self):
         original = self.repository.view()
         message = Message.create(Heartbeat(A, EARLY, None), sent_at=NOW)
-        with patch.object(UnitOfWork, "enqueue", side_effect=OSError("disk unavailable")):
+        with self.assertNoLogs("usvisa.coordinator", level="INFO"), \
+                patch.object(UnitOfWork, "enqueue", side_effect=OSError("disk unavailable")):
             with self.assertRaises(OSError):
                 self.service.handle(message, publisher=f"node_{A}", now=NOW)
         self.assertEqual(self.repository.view(), original)
         self.assertEqual(self.drain(), [])
-        result = self.service.handle(message, publisher=f"node_{A}", now=NOW)
+        with self.assertLogs("usvisa.coordinator", level="INFO") as recorded:
+            result = self.service.handle(message, publisher=f"node_{A}", now=NOW)
+        self.assertTrue(any("Heartbeat received" in line for line in recorded.output))
+        self.assertTrue(any("Schedule updated" in line for line in recorded.output))
         self.assertEqual(result.status, "processed")
         self.assertEqual(self.repository.schedule().revision, 1)
 

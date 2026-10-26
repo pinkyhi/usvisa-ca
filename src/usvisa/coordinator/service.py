@@ -39,6 +39,7 @@ class Coordinator:
         work.enqueue(node.node_id, "visa.control", message)
 
     def _reconcile(self, work: UnitOfWork, now: datetime) -> bool:
+        was_active = {node.node_id for node in work.nodes() if node.active}
         work.expire_members(now - timedelta(seconds=PRESENCE_SECONDS))
         nodes = work.nodes()
         active = {node.node_id: node for node in nodes if node.active}
@@ -51,6 +52,11 @@ class Coordinator:
             assignments = assign_phases(set(active), previous, now=now) if membership_changed else previous
             state = ScheduleState(uuid4(), state.revision + 1, self.config, report_before)
             work.save_schedule(state, assignments)
+            for node_id in sorted(was_active - active.keys(), key=str):
+                work.log_event("Node inactive", nodeId=node_id, reason="heartbeat_timeout")
+            work.log_event("Schedule updated", scheduleVersion=state.schedule_version, revision=state.revision,
+                           activeNodes=len(active), joined=sorted(map(str, active.keys() - previous.keys())),
+                           removed=sorted(map(str, previous.keys() - active.keys())), reportBefore=report_before)
             for node in work.nodes():
                 if node.active:
                     self._snapshot(work, node, now)
@@ -78,6 +84,7 @@ class Coordinator:
             if work.node(node_id) is None:
                 raise ValueError("Unknown node")
             work.revoke(node_id)
+            work.log_event("Node access revoked", nodeId=node_id)
             return self._reconcile(work, utc(now))
 
     def handle(self, message: Message, *, publisher: str, now: datetime) -> ProcessingResult:
@@ -104,6 +111,9 @@ class Coordinator:
             else:
                 result = self._finding(work, source, message, now)
             work.record(source.node_id, message, result.status, result.reason, now)
+            if result.status == "ignored":
+                work.log_event("Command ignored", nodeId=source.node_id, messageId=message.message_id,
+                               eventType=message.type, reason=result.reason)
             return result
 
     def _reject(self, work: UnitOfWork, source: NodeRecord, message: Message, now: datetime,
@@ -124,9 +134,13 @@ class Coordinator:
             return ProcessingResult("ignored", "OLDER_HEARTBEAT")
         data = message.data
         work.heartbeat(source.node_id, data.min_date, message.sent_at, min(message.sent_at, now))
+        work.log_event("Heartbeat received", nodeId=source.node_id, messageId=message.message_id,
+                       minDate=data.min_date, receivedScheduleVersion=data.schedule_version)
         changed = self._reconcile(work, now)
         if not changed and data.schedule_version != work.schedule().schedule_version:
             self._snapshot(work, work.node(source.node_id), now, message.message_id)
+            work.log_event("Schedule resync queued", nodeId=source.node_id,
+                           scheduleVersion=work.schedule().schedule_version)
         return ProcessingResult("processed")
 
     def _finding(self, work: UnitOfWork, source: NodeRecord, message: Message,
@@ -140,6 +154,7 @@ class Coordinator:
         if expires_at <= now:
             return ProcessingResult("ignored", "EXPIRED_FINDING")
         work.finding(source.node_id, message, expires_at)
+        recipients = []
         for recipient in work.nodes():
             if not recipient.active or recipient.node_id == source.node_id:
                 continue
@@ -148,4 +163,8 @@ class Coordinator:
                 event = Message.create(SlotsAvailable(message.message_id, source.node_id,
                                                        data.observed_at, expires_at, dates), sent_at=now)
                 work.enqueue(recipient.node_id, "visa.slots", event, expires_at)
+                recipients.append(str(recipient.node_id))
+        work.log_event("Slots found", nodeId=source.node_id, messageId=message.message_id,
+                       dates=data.dates, observedAt=data.observed_at, expiresAt=expires_at,
+                       recipients=recipients)
         return ProcessingResult("processed")

@@ -59,7 +59,6 @@ USER_PASSWORD=""    # The password for your  https://ais.usvisa-info.com/en-ca/n
 NUM_PARTICIPANTS=1
 TEST_MODE=true          # false enables real booking
 SHOW_GUI=true          # show Chrome during login
-RUN_ONCE=true          # perform one availability check and exit
 PERSIST_SESSION=true   # reuse login cookies between runs
 EARLIEST_ACCEPTABLE_DATE="" # The earliest interview date you are looking for
 LATEST_ACCEPTABLE_DATE=""   # The latest acceptable interview date
@@ -103,12 +102,11 @@ RATE_LIMIT_BACKOFF_MAX_DELAY=4096
 RATE_LIMIT_BACKOFF_MULTIPLIER=2
 ```
 
-With `RUN_ONCE=false`, checks continue on the same authenticated HTTP session
-until a suitable slot is found or the program is stopped. The cycle gap replaces
+Checks continue on the same authenticated HTTP session until a real booking is
+verified or the program is stopped. A dry run keeps polling. The cycle gap replaces
 the normal delay after the configured number of dates requests. Cycles reuse the
-HTTP session. With cycle length 0, checks run continuously. `RUN_ONCE=true` performs
-one availability check, with no delay or retry, including on HTTP 429. A suitable
-date can trigger further requests for times, the booking form and verification.
+HTTP session. With cycle length 0, checks run continuously. A suitable date can
+trigger further requests for times, the booking form and verification.
 Restart the script after changing `.env`.
 
 Every nonempty availability response is appended to `logs/available_dates.log`
@@ -126,15 +124,13 @@ Empty dates use the ordinary polling delay and cycle gap, without exponential
 backoff or reauthentication. The HTTP 429 backoff restarts when the program
 restarts. Errors and empty responses count
 toward cycles; at a cycle boundary the longer applicable pause is used, without
-adding the cycle gap to backoff. In solo mode, `RUN_ONCE` never waits or retries;
-in coordinated mode it waits for its first assigned phase before the single check.
+adding the cycle gap to backoff.
 The HTTP 429 backoff is enabled only when all three of its parameters are present and
 positive. Setting any parameter to `0`, leaving it blank or omitting it disables
 that backoff, including the stop after exhausted HTTP 429 cooldowns. A disabled
 backoff uses the ordinary polling delay and cycle gap; HTTP 429 still respects
 `Retry-After`. Initial and maximum delays are in seconds; multipliers are unitless.
-Expired authentication restarts Selenium login with `RUN_ONCE=false`; with
-`RUN_ONCE=true`, an expired session ends the run instead.
+Expired authentication restarts Selenium login and resumes polling.
 
 With `PERSIST_SESSION=true` (default), cookies and the appointment URL are saved
 per account in `.sessions/` (ignored by Git). Valid sessions skip Selenium on
@@ -180,6 +176,8 @@ python scripts/server.py create-user --username admin
 ```
 
 Open the displayed HTTPS URL, sign in, create a node, and save its token/configuration. Install `python -m pip install -e ".[node,coordinated]"` on each Node, fill its local visa settings, set `MODE=coordinated`, `SERVER_URL`, `NODE_TOKEN`, and `NODE_MIN_DATE`, then launch it. Each node polls every 180 seconds with evenly spaced phases (90 seconds apart for two nodes). Heartbeats and delivery run independently of the visa worker. Use `TEST_MODE=true` for the first run.
+
+After a verified real booking, the node prints a green uppercase success message and saves a booking stop in its local SQLite state. Coordinated monitoring, heartbeats and sharing continue, while further booking from either local checks or received findings stays disabled across restarts. The booked date is excluded from future findings. Dry runs do not set this stop and keep polling. Solo mode exits after success; an uncertain booking outcome retains the submission guard and stops for manual verification.
 
 For a combined Docker deployment, save `PORTAL_USERNAME`, `PORTAL_PASSWORD`, and `NODE_NAME` in the private `.env` instead of copying a token. Keep `COMPOSE_PROFILES=${MODE:-solo},${MODE:-solo}-${EXPOSE_MODE:-cloudflare_quick}` alongside `MODE` and `EXPOSE_MODE`. Then `docker compose up -d --build` starts the Coordinator and a Chromium-equipped Node, registers it once, persists its token, receives a schedule, and runs the existing visa worker. `MODE=solo` selects only the Node. Use `python scripts/server.py up --mode solo` or `--mode coordinated` to switch modes and stop unused services automatically. The local Node and Coordinator discover changing Quick Tunnel hostnames without Docker socket access; remote nodes still need their `SERVER_URL` updated. See the setup guide for persistent state and first-account setup.
 

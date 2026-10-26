@@ -22,6 +22,7 @@ from .auth import authenticate, digest, normalize_username, session_user
 from .broker import BrokerAdmin, BrokerRuntime
 from .repository import Repository
 from .service import Coordinator
+from .observability import event as log_event
 
 
 class Login(BaseModel):
@@ -64,7 +65,7 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
                 if origin != public_origin["value"]:
                     await run_in_threadpool(save_private_json, origin_file, {"origin": origin})
                     public_origin["value"] = origin
-                    print("Public portal address: " + origin, flush=True)
+                    log_event("Public portal address changed", serverUrl=origin)
             except (OSError, ValueError, KeyError, TypeError):
                 pass
             await asyncio.sleep(2)
@@ -76,6 +77,15 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
             if run_broker:
                 await admin.bootstrap()
                 await runtime.start()
+                state = repository.view()
+                log_event("Coordinator ready", city=config.group.city, serverUrl=public_origin["value"],
+                          scheduleVersion=state["scheduleVersion"], revision=state["revision"],
+                          reportBefore=state["reportBefore"],
+                          activeNodes=sum(node["active"] for node in state["nodes"]))
+                for node in state["nodes"]:
+                    if node["active"]:
+                        log_event("Scheduled node restored", nodeId=node["nodeId"],
+                                  minDate=node["minDate"], startAt=node["startAt"])
                 if os.getenv("EXPOSE_MODE") == "cloudflare_quick" and os.getenv("QUICK_TUNNEL_METRICS"):
                     follower = asyncio.create_task(follow_tunnel())
             yield
@@ -85,6 +95,8 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
                 with suppress(asyncio.CancelledError):
                     await follower
             await runtime.close()
+            if run_broker:
+                log_event("Coordinator stopped")
             await admin.close()
             if owned_repository:
                 repository.close()
@@ -200,7 +212,9 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
             secret = secrets.token_urlsafe(32)
             try:
                 await admin.provision(node_id, secret)
-            except Exception:
+            except Exception as error:
+                log_event("Node provisioning deferred", nodeId=node_id, username=user["username"],
+                          reason=type(error).__name__)
                 raise HTTPException(503, "Broker provisioning unavailable; retry with the same Idempotency-Key") from None
             with repository.transaction() as work:
                 work.connection.execute("UPDATE portal_nodes SET token_hash=? WHERE node_id=?",
@@ -209,6 +223,8 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
                                         (str(node_id),))
                 work.connection.execute("UPDATE operations SET completed=1 WHERE owner_id=? AND key=?",
                                         (user["user_id"], key))
+                work.log_event("Node created" if action == "create" else "Node token rotated",
+                               nodeId=node_id, username=user["username"], **({"nodeName": name.strip()} if name else {}))
             return JSONResponse({"nodeId": str(node_id), "token": f"{node_id}.{secret}",
                                  "connection": connection(node_id)}, status_code=201 if action == "create" else 200)
 
@@ -249,8 +265,10 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
             status, user = await run_in_threadpool(authenticate, repository, username, body.password,
                                                  request.client.host if request.client else "unknown")
         if status != "ok":
+            log_event("Portal sign-in failed", username=username, reason=status)
             raise HTTPException(429 if status == "limited" else 401,
                                 "Try again later" if status == "limited" else "Invalid username or password")
+        log_event("Portal sign-in successful", username=user["username"])
         response = JSONResponse({"userId": user["userId"], "username": user["username"], "csrfToken": user["csrfToken"]})
         response.set_cookie("visa_session", user["session"], max_age=43_200, httponly=True,
                             secure=not config.insecure_local, samesite="strict")
@@ -259,10 +277,11 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
 
     @app.delete("/api/v1/session", status_code=204)
     async def logout(request: Request):
-        current(request)
+        user = current(request)
         with repository.transaction() as work:
             work.connection.execute("DELETE FROM sessions WHERE session_hash=?",
                                     (digest(request.cookies["visa_session"]),))
+            work.log_event("Portal signed out", username=user["username"])
         from fastapi import Response
         response = Response(status_code=204)
         response.delete_cookie("visa_session")
@@ -301,7 +320,9 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
             service.revoke(node_id, now=datetime.now(timezone.utc))
             try:
                 await admin.revoke(node_id)
-            except Exception:
+            except Exception as error:
+                log_event("Broker access revocation deferred", nodeId=node_id, reason=type(error).__name__)
                 raise HTTPException(503, "Local access revoked; retry to finish revocation at broker") from None
+            log_event("Broker access revoked", nodeId=node_id, username=user["username"])
 
     return app
