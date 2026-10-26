@@ -85,8 +85,8 @@ python reschedule.py
 
 Selenium only signs in and hands off cookies; Chrome then closes. `requests`
 discovers the application, follows setup links and completes consent screens,
-checks availability, submits the booking and verifies
-the saved date, time and consulate. `TEST_MODE=true` (default) prepares the form
+prepares reusable booking fields and CSRF in memory, checks availability, submits the booking and verifies
+the saved date, time and consulate. Once a date is found, the ready session requests its available times and submits without reloading the form. Restored sessions also prepare the form before polling; expired authentication or a changed application discards it. The selected time still comes from the live times endpoint. `TEST_MODE=true` (default) prepares the form
 without submitting it; set `TEST_MODE=false` in `.env` for real booking.
 An unverified booking stops the script for manual checking.
 
@@ -237,6 +237,6 @@ not recorded. Audit writes are flushed to disk; a write failure stops execution.
 The submission marker is kept independently of the audit log.
 
 The flow is: restore session or sign in ? discover application and prepare form
-? fetch and filter dates ? fetch fresh form and available times ? choose earliest
+? retain the prepared form in memory ? fetch and filter dates ? fetch available times ? choose earliest
 time ? dry-run exit, or persist guard and submit once ? verify the saved date,
 time and consulate ? notify and exit. Unknown outcomes require manual checking.

@@ -85,6 +85,102 @@ class BookingTests(NoNetworkTest):
         ]
         self.session.post.return_value = response("Successfully Scheduled")
 
+    def test_ready_session_sends_booking_after_times_without_reloading_form(self):
+        self.session.get.side_effect = [
+            response(FORM), response(payload=[{"date": DAY.isoformat()}]),
+            response(payload={"available_times": ["08:30"]}),
+            response(SAVED, url=URL + "/instructions"),
+        ]
+        self.session.post.return_value = response(status=302)
+        self.client.check_session()
+        day = self.client.get_available_dates()[0]
+        self.assertEqual(self.client.book(day, dry_run=False), BookingResult(DAY, "08:30", False))
+        self.assertEqual([call.args[0] for call in self.session.get.call_args_list], [
+            URL, URL + "/days/95.json", URL + "/times/95.json", URL + "/instructions",
+        ])
+        self.session.post.assert_called_once()
+        self.assertEqual(dict(self.session.post.call_args.kwargs["data"])["authenticity_token"], "fresh-token")
+        events = [json.loads(line) for line in audit.LOG_PATH.read_text().splitlines()]
+        prepared = next(item for item in events if item["event"] == "booking_prepared")
+        self.assertTrue(prepared["prepared_form_cached"])
+
+    def test_next_candidate_reuses_prepared_fields_after_empty_times(self):
+        next_day = DAY + timedelta(days=1)
+        self.session.get.side_effect = [
+            response(FORM), response(payload={"available_times": []}),
+            response(payload={"available_times": ["08:30"]}),
+            response(SAVED.replace("12 November", "13 November"), url=URL + "/instructions"),
+        ]
+        self.session.post.return_value = response(status=302)
+        self.client.check_session()
+        self.assertIsNone(self.client.book(DAY, dry_run=False))
+        self.assertFalse((audit.GUARD_DIR / "123.json").exists())
+        self.assertEqual(self.client.book(next_day, dry_run=False), BookingResult(next_day, "08:30", False))
+        self.assertEqual([call.args[0] for call in self.session.get.call_args_list], [
+            URL, URL + "/times/95.json", URL + "/times/95.json", URL + "/instructions",
+        ])
+        self.session.post.assert_called_once()
+        fields = self.session.post.call_args.kwargs["data"]
+        self.assertEqual(dict(fields)["appointments[consulate_appointment][date]"], next_day.isoformat())
+        self.assertEqual([value for name, value in fields if name == "appointments[applicant_ids][]"],
+                         ["101", "102"])
+        events = [json.loads(line) for line in audit.LOG_PATH.read_text().splitlines()]
+        no_times = [item for item in events if item["event"] == "booking_no_times"]
+        self.assertEqual(len(no_times), 1)
+        self.assertEqual(no_times[0]["date"], DAY.isoformat())
+        self.assertFalse(no_times[0]["booking_post_sent"])
+
+    def test_failed_form_refresh_does_not_allow_an_older_prepared_form(self):
+        self.session.get.return_value = response(FORM)
+        self.client.check_session()
+        self.session.get.return_value = response(FORM.replace('value="fresh-token"', 'value=""'))
+        with self.assertRaisesRegex(PortalError, "CSRF"):
+            self.client.check_session()
+        with self.assertRaisesRegex(PortalError, "CSRF"):
+            self.client.book(DAY, dry_run=False)
+        self.session.post.assert_not_called()
+        self.assertFalse((audit.GUARD_DIR / "123.json").exists())
+
+    def test_authentication_expiry_discards_prepared_form(self):
+        self.session.get.return_value = response(FORM)
+        self.client.check_session()
+        self.session.get.return_value = response(status=401)
+        with self.assertRaises(AuthenticationExpired):
+            self.client.get_available_dates()
+        self.prepare(form=FORM.replace("fresh-token", "renewed-token"))
+        self.assertEqual(self.client.book(DAY, dry_run=False), BookingResult(DAY, "08:30", False))
+        self.assertEqual(dict(self.session.post.call_args.kwargs["data"])["authenticity_token"], "renewed-token")
+        self.session.post.assert_called_once()
+
+    def test_prepared_form_does_not_bypass_shared_slot_expiry_during_times_get(self):
+        self.session.get.return_value = response(FORM)
+        self.client.check_session()
+        self.session.get.side_effect = [response(payload={"available_times": ["08:30"]})]
+        observed = datetime.now(timezone.utc)
+        with patch("usvisa.visa.appointment_client.datetime") as clock:
+            clock.now.side_effect = [observed, observed + timedelta(seconds=2)]
+            self.assertIsNone(self.client.book(DAY, dry_run=False, expires_at=observed + timedelta(seconds=1)))
+        self.assertEqual([call.args[0] for call in self.session.get.call_args_list],
+                         [URL, URL + "/times/95.json"])
+        self.session.post.assert_not_called()
+        self.assertFalse((audit.GUARD_DIR / "123.json").exists())
+
+    def test_rejected_prepared_post_keeps_guard_without_refetching_or_resubmitting(self):
+        self.session.get.side_effect = [
+            response(FORM), response(payload={"available_times": ["08:30"]}),
+            response(OLD, url=URL + "/instructions"), response("<html></html>"),
+        ]
+        self.session.post.return_value = response(status=422)
+        self.client.check_session()
+        with self.assertRaises(BookingNotVerified):
+            self.client.book(DAY, dry_run=False)
+        self.session.get.side_effect = [response(payload={"available_times": ["08:30"]})]
+        with self.assertRaises(BookingNotVerified):
+            self.client.book(DAY + timedelta(days=1), dry_run=False)
+        self.session.post.assert_called_once()
+        self.assertTrue((audit.GUARD_DIR / "123.json").exists())
+        self.assertEqual([call.args[0] for call in self.session.get.call_args_list].count(URL), 1)
+
     def test_second_client_cannot_submit_after_verified_booking(self):
         self.prepare()
         self.client.book(DAY, dry_run=False)
