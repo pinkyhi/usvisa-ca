@@ -1,5 +1,6 @@
 """HTTP availability and booking using a session authenticated by Selenium."""
 
+import random
 import re
 import time as clock
 from usvisa.shared import audit
@@ -479,7 +480,7 @@ class AppointmentClient:
         if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
             audit.event("shared_slot_expired", date=day)
             return None
-        slot_time = times[0]
+        slot_time = random.choice(times)
         prefix = "appointments[consulate_appointment]"
         values = {
             f"{prefix}[facility_id]": str(self.facility_id),

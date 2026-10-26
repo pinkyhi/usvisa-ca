@@ -75,6 +75,9 @@ class BookingTests(NoNetworkTest):
         super().setUp()
         self.session = Mock(spec=requests.Session)
         self.client = AppointmentClient(self.session, URL, 95, "Vancouver", timeout=17)
+        selector = patch("usvisa.visa.appointment_client.random.choice", side_effect=lambda choices: choices[0])
+        selector.start()
+        self.addCleanup(selector.stop)
 
     def prepare(self, saved=SAVED, form=FORM, times=None):
         if times is None:
@@ -84,6 +87,25 @@ class BookingTests(NoNetworkTest):
             response(saved, url=URL + "/instructions"), response("<html></html>"),
         ]
         self.session.post.return_value = response("Successfully Scheduled")
+
+    def test_random_time_is_used_in_post_and_saved_appointment_verification(self):
+        self.prepare(saved=SAVED.replace("08:30", "10:00"))
+        with patch("usvisa.visa.appointment_client.random.choice", return_value="10:00") as choose:
+            self.assertEqual(self.client.book(DAY, dry_run=False), BookingResult(DAY, "10:00", False))
+        choose.assert_called_once_with(["08:30", "10:00"])
+        self.session.post.assert_called_once()
+        fields = dict(self.session.post.call_args.kwargs["data"])
+        self.assertEqual(fields["appointments[consulate_appointment][time]"], "10:00")
+
+    def test_timeout_does_not_try_another_available_time(self):
+        self.prepare(saved=OLD)
+        self.session.post.side_effect = requests.Timeout()
+        with patch("usvisa.visa.appointment_client.random.choice", return_value="10:00") as choose:
+            with self.assertRaises(BookingNotVerified):
+                self.client.book(DAY, dry_run=False)
+        choose.assert_called_once_with(["08:30", "10:00"])
+        self.session.post.assert_called_once()
+        self.assertTrue((audit.GUARD_DIR / "123.json").exists())
 
     def test_ready_session_sends_booking_after_times_without_reloading_form(self):
         self.session.get.side_effect = [
