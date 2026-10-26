@@ -75,7 +75,7 @@ def authenticated_client():
     if client:
         try:
             client.check_session()
-            solo.log_message("Saved visa session verified")
+            solo.log_message(f"Saved visa session verified for {cfg.USER_EMAIL}")
         except AuthenticationExpired:
             client.session.close()
             cache.invalidate()
@@ -104,7 +104,7 @@ def authenticated_client():
             solo.close_driver(driver)
         try:
             client.prepare_session()
-            solo.log_message("Visa login successful; appointment session prepared")
+            solo.log_message(f"Visa login successful for {cfg.USER_EMAIL}; appointment session prepared")
         except BaseException:
             client.session.close()
             raise

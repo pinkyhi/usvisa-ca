@@ -112,6 +112,49 @@ class BookingTests(NoNetworkTest):
         self.session.post.assert_not_called()
         self.assertEqual(self.session.get.call_count, 2)
         self.assertEqual(self.session.get.call_args.kwargs["params"]["date"], DAY.isoformat())
+        self.assertFalse((audit.GUARD_DIR / "123.json").exists())
+        events = [json.loads(line) for line in audit.LOG_PATH.read_text().splitlines()]
+        self.assertFalse(any(item["event"] == "booking_post_started" for item in events))
+        self.assertEqual(events[-1]["event"], "booking_dry_run")
+        self.assertFalse(events[-1]["booking_post_sent"])
+
+    def test_verified_booking_audit_records_attempt_and_saved_slot_without_secrets(self):
+        self.prepare()
+        self.client.book(DAY, dry_run=False)
+        text = audit.LOG_PATH.read_text()
+        events = [json.loads(line) for line in text.splitlines()]
+        booking = [item for item in events if item["event"].startswith("booking_")]
+        self.assertEqual([item["event"] for item in booking], [
+            "booking_prepared", "booking_post_started", "booking_post_outcome", "booking_verification",
+        ])
+        self.assertEqual(booking[2]["outcome"], "HTTP 200")
+        self.assertGreaterEqual(booking[2]["elapsed_ms"], 0)
+        self.assertTrue(booking[-1]["verified"])
+        self.assertEqual(booking[-1]["date"], DAY.isoformat())
+        self.assertEqual(booking[-1]["time"], "08:30")
+        self.assertEqual(booking[-1]["consulate"], "Vancouver")
+        for item in booking:
+            self.assertEqual(datetime.fromisoformat(item["timestamp"]).utcoffset(), timedelta(0))
+            self.assertEqual(item["run_id"], audit.RUN_ID)
+            self.assertIsInstance(item["pid"], int)
+        self.assertNotIn("fresh-token", text)
+        self.assertNotIn("Successfully Scheduled", text)
+        self.assertNotIn("authenticity_token", text)
+
+    def test_verification_error_is_logged_and_retains_guard_without_repeating_post(self):
+        self.prepare()
+        with patch.object(self.client, "verify_booking", side_effect=RuntimeError("private-response")):
+            with self.assertRaises(BookingNotVerified):
+                self.client.book(DAY, dry_run=False)
+        self.session.post.assert_called_once()
+        self.assertTrue((audit.GUARD_DIR / "123.json").exists())
+        text = audit.LOG_PATH.read_text()
+        events = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual(events[-1]["event"], "booking_verification")
+        self.assertFalse(events[-1]["verified"])
+        self.assertEqual(events[-1]["error_type"], "RuntimeError")
+        self.assertEqual(events[-1]["date"], DAY.isoformat())
+        self.assertNotIn("private-response", text)
 
     def test_received_slot_already_expired_does_not_query_or_reserve_a_submission(self):
         expired = datetime.now(timezone.utc) - timedelta(seconds=1)
@@ -299,6 +342,47 @@ class BookingTests(NoNetworkTest):
             self.assertTrue(appointment_matches(text, DAY, "08:30"))
         self.assertTrue(appointment_matches("12 November, 2026, 12:00 AM", DAY, "00:00"))
         self.assertFalse(appointment_matches("12 November, 2026 8:30 PM", DAY, "08:30"))
+
+
+class BookingRedirectTests(IsolatedLogsTest):
+    def test_redirect_cannot_resubmit_booking_and_saved_record_is_checked(self):
+        for status in (302, 307, 308):
+            for verified in (True, False):
+                with self.subTest(status=status, verified=verified), \
+                     patch.object(audit, "GUARD_DIR", self.test_log_directory / f"{status}-{verified}"), \
+                     requests.Session() as session:
+                    sent = []
+
+                    def send(request, **kwargs):
+                        sent.append(request)
+                        if request.method == "POST":
+                            result = response(url=request.url)
+                            if sum(item.method == "POST" for item in sent) == 1:
+                                result.status_code = status
+                                result.headers["Location"] = URL + "/redirected"
+                        elif request.url == URL:
+                            result = response(FORM)
+                        elif "/times/" in request.url:
+                            result = response(payload={"available_times": ["08:30"]}, url=request.url)
+                        elif request.url == URL + "/instructions":
+                            result = response(SAVED if verified else OLD, url=request.url)
+                        else:
+                            result = response("<html></html>", url=request.url)
+                        result.request = request
+                        return result
+
+                    client = AppointmentClient(session, URL, 95, "Vancouver")
+                    # Keep requests' real redirect handling; replace only network I/O.
+                    with patch("requests.adapters.HTTPAdapter.send", side_effect=send):
+                        if verified:
+                            self.assertEqual(client.book(DAY, dry_run=False), BookingResult(DAY, "08:30", False))
+                        else:
+                            with self.assertRaises(BookingNotVerified):
+                                client.book(DAY, dry_run=False)
+                    self.assertEqual(sum(request.method == "POST" for request in sent), 1)
+                    self.assertTrue(any(request.method == "GET" and request.url == URL + "/instructions"
+                                        for request in sent))
+                    self.assertTrue((audit.GUARD_DIR / "123.json").exists())
 
 
 class RunnerTests(NoNetworkTest):

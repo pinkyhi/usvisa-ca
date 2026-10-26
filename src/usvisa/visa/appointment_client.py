@@ -496,6 +496,9 @@ class AppointmentClient:
         try:
             response = self.session.post(
                 self.appointment_url, data=fields, timeout=self.timeout,
+                # A 307/308 redirect would replay this POST inside requests.
+                # Verify the saved appointment with explicit GETs below instead.
+                allow_redirects=False,
                 headers={"Referer": self.appointment_url,
                          "Origin": f"{origin.scheme}://{origin.netloc}",
                          "X-CSRF-Token": csrf},
@@ -508,6 +511,8 @@ class AppointmentClient:
         try:
             verified = self.verify_booking(day, slot_time)
         except Exception as error:
+            audit.event("booking_verification", verified=False, date=day, time=slot_time,
+                        consulate=self.consulate, error_type=type(error).__name__)
             raise BookingNotVerified("Booking verification failed after submission; guard retained. Check the portal manually.") from error
         audit.event("booking_verification", verified=verified, date=day, time=slot_time, consulate=self.consulate)
         if verified:

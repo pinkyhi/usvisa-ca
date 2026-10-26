@@ -286,7 +286,7 @@ Coordinator может исключить её и назначить фазу д
 
 ## Пороги и адресная рассылка
 
-Личный minDate — порог уведомлений: полезна дата строго раньше него. Это отдельная настройка NODE_MIN_DATE. Она не заменяет EARLIEST_ACCEPTABLE_DATE, LATEST_ACCEPTABLE_DATE и исключения для собственного бронирования.
+Личный minDate — порог уведомлений: полезна дата строго раньше него. По умолчанию он вычисляется как LATEST_ACCEPTABLE_DATE + 1 день, чтобы включать последний допустимый день; NODE_MIN_DATE остаётся необязательным переопределением. EARLIEST_ACCEPTABLE_DATE, LATEST_ACCEPTABLE_DATE и исключения определяют собственное бронирование.
 
 Coordinator хранит личные пороги и сообщает всем одинаковый предварительный порог:
 
@@ -495,7 +495,7 @@ Idempotency-Key предотвращает второго пользовател
 MODE=coordinated
 SERVER_URL=https://visa-server.tailnet-name.ts.net
 NODE_TOKEN={nodeId}.{secret}
-NODE_MIN_DATE=2027-12-01
+# minDate автоматически равен LATEST_ACCEPTABLE_DATE + 1 день.
 # /ws и vhost visa задаются общим контрактом.
 # Остальные локальные настройки визового аккаунта сохраняются.
 ~~~

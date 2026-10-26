@@ -23,7 +23,7 @@ NODE_NAME=Main Node
 docker compose up -d --build
 ```
 
-Запускаются Node, Coordinator, RabbitMQ, edge и выбранный tunnel. Node входит в портал по HTTPS, получает персональный токен, подключается по WSS, отправляет heartbeat, получает расписание и запускает прежний визовый worker. `NODE_MIN_DATE` по умолчанию берётся из `LATEST_ACCEPTABLE_DATE`; ручной `NODE_TOKEN` также поддерживается. Пароль портала не добавляется в сообщения брокера.
+Запускаются Node, Coordinator, RabbitMQ, edge и выбранный tunnel. Node входит в портал по HTTPS, получает персональный токен, подключается по WSS, отправляет heartbeat, получает расписание и запускает прежний визовый worker. Личный порог уведомлений автоматически равен `LATEST_ACCEPTABLE_DATE + 1 день`; ручной `NODE_TOKEN` также поддерживается. Пароль портала не добавляется в сообщения брокера.
 
 `docker compose logs -f node` показывает подключение к Coordinator, сохранённое или новое расписание, готовность визовой сессии, время следующей проверки и число найденных дат, включая ноль. Сообщение о временной недоступности регистрации означает переход на сохранённые credentials; восстановление соединения выводится отдельно. В стандартном Docker-образе время логов — UTC; время следующей проверки также содержит явное смещение `+00:00`.
 
@@ -130,7 +130,6 @@ Copy-Item .env.example .env
 MODE=coordinated
 SERVER_URL=https://your-server.example
 NODE_TOKEN=full_token_from_portal
-NODE_MIN_DATE=2027-05-01
 QUICK_TUNNEL_METRICS=
 
 USER_EMAIL=your-visa-account@example.com
@@ -145,7 +144,7 @@ SHOW_GUI=false
 PERSIST_SESSION=true
 ```
 
-`NODE_MIN_DATE` — личный порог уведомлений: полезны даты строго раньше него. `EARLIEST_ACCEPTABLE_DATE`, `LATEST_ACCEPTABLE_DATE` и исключения управляют собственным booking. Совпадение города/consulateId с сервером обязательно; клиент останавливается при несовпадении.
+`EARLIEST_ACCEPTABLE_DATE`, `LATEST_ACCEPTABLE_DATE` и исключения управляют собственным booking; обе границы диапазона включены. Личный порог уведомлений вычисляется автоматически как `LATEST_ACCEPTABLE_DATE + 1 день`: Coordinator присылает даты строго раньше него, включая последний допустимый день. При необходимости отдельный `NODE_MIN_DATE` переопределяет этот порог. Совпадение города/consulateId с сервером обязательно; клиент останавливается при несовпадении.
 
 ### Проверка связи и запуск
 
