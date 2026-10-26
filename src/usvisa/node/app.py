@@ -1,6 +1,7 @@
 """Node command line; help does not import browser or network clients."""
 
 import argparse
+from datetime import date, timedelta
 
 from usvisa import __version__
 
@@ -37,9 +38,12 @@ def main(argv=None):
         try:
             settings.validate_settings()
             if not os.environ.get("NODE_MIN_DATE"):
-                os.environ["NODE_MIN_DATE"] = settings.LATEST_ACCEPTABLE_DATE
+                # The booking limit is inclusive; Coordinator uses day < minDate.
+                os.environ["NODE_MIN_DATE"] = (
+                    date.fromisoformat(settings.LATEST_ACCEPTABLE_DATE) + timedelta(days=1)
+                ).isoformat()
             prepare()
-        except ValueError as error:
+        except (ValueError, OverflowError) as error:
             print(f"Invalid coordinated configuration: {error}")
             return 2
         except KeyboardInterrupt:

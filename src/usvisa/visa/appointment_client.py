@@ -1,5 +1,6 @@
 """HTTP availability and booking using a session authenticated by Selenium."""
 
+import random
 import re
 import time as clock
 from usvisa.shared import audit
@@ -138,10 +139,12 @@ class AppointmentClient:
         self.appointment_url = None
         self.appointment_params = {}
         self.schedule_id = None
+        self._prepared_form = None
         if appointment_url is not None:
             self._set_appointment_url(appointment_url)
 
     def _set_appointment_url(self, appointment_url):
+        self._prepared_form = None
         self.appointment_url = appointment_url.rstrip("/")
         match = re.search(r"/schedule/(\d+)/appointment$", self.appointment_url)
         if not match:
@@ -288,10 +291,12 @@ class AppointmentClient:
         if response.status_code == 429:
             raise RateLimited(response.headers.get("Retry-After"))
         if "/users/sign_in" in response.url or response.status_code in {401, 403}:
+            self._prepared_form = None
             raise AuthenticationExpired("HTTP session expired or was rejected; a new login is needed")
         if response.status_code != 200:
             raise PortalError(f"Portal GET returned HTTP {response.status_code}")
         if re.search(r'<input\b[^>]*\bid=[\"\']user_email[\"\']', response.text, re.I):
+            self._prepared_form = None
             raise AuthenticationExpired("Portal returned the login form")
 
     def _json(self, url, params):
@@ -333,6 +338,9 @@ class AppointmentClient:
             raise PortalError("Unexpected appointment time format") from error
 
     def _booking_form(self, prepare=False):
+        # Prepare during login/session validation, outside the slot-to-POST path.
+        # A failed refresh must not leave an older form available for submission.
+        self._prepared_form = None
         options = {"params": self.appointment_params} if self.appointment_params else {}
         response = self._get(self.appointment_url, **options)
         response = self._prepare_booking_form(response, allow_post=prepare)
@@ -360,7 +368,8 @@ class AppointmentClient:
         for control in form.find_all(attrs={"required": True, "name": True}):
             if "[asc_appointment]" in control["name"] and not values.get(control["name"]):
                 raise PortalError("This account requires an ASC appointment; complete its setup first")
-        return fields, csrf
+        self._prepared_form = (tuple(fields), csrf)
+        return self._prepared_form
 
     def check_session(self):
         """Validate a restored login with a read-only request for its booking form."""
@@ -457,17 +466,21 @@ class AppointmentClient:
         if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
             audit.event("shared_slot_expired", date=day)
             return None
-        # GET the form before querying times so cookie/CSRF rotation is retained.
-        fields, csrf = self._booking_form()
+        # Startup already validated the form and CSRF in this HTTP session.
+        # Direct callers without that preparation still need one form GET.
+        form_cached = self._prepared_form is not None
+        fields, csrf = self._prepared_form if form_cached else self._booking_form()
         times = self.get_available_times(day)
         if not times:
+            audit.event("booking_no_times", date=day, booking_post_sent=False,
+                        prepared_form_cached=form_cached)
             return None
         # A received finding can expire while form/times GETs are in flight.
         # Recheck before preparing a result or reserving a booking submission.
         if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
             audit.event("shared_slot_expired", date=day)
             return None
-        slot_time = times[0]
+        slot_time = random.choice(times)
         prefix = "appointments[consulate_appointment]"
         values = {
             f"{prefix}[facility_id]": str(self.facility_id),
@@ -479,7 +492,8 @@ class AppointmentClient:
         fields = replace_fields(fields, values)
         result = BookingResult(day, slot_time, dry_run)
         audit.event("booking_prepared", date=day, time=slot_time, consulate=self.consulate,
-                    dry_run=dry_run, applicant_count=sum(name == "appointments[applicant_ids][]" for name, _ in fields))
+                    dry_run=dry_run, prepared_form_cached=form_cached,
+                    applicant_count=sum(name == "appointments[applicant_ids][]" for name, _ in fields))
         if dry_run:
             audit.event("booking_dry_run", booking_post_sent=False)
             return result
@@ -496,6 +510,9 @@ class AppointmentClient:
         try:
             response = self.session.post(
                 self.appointment_url, data=fields, timeout=self.timeout,
+                # A 307/308 redirect would replay this POST inside requests.
+                # Verify the saved appointment with explicit GETs below instead.
+                allow_redirects=False,
                 headers={"Referer": self.appointment_url,
                          "Origin": f"{origin.scheme}://{origin.netloc}",
                          "X-CSRF-Token": csrf},
@@ -508,6 +525,8 @@ class AppointmentClient:
         try:
             verified = self.verify_booking(day, slot_time)
         except Exception as error:
+            audit.event("booking_verification", verified=False, date=day, time=slot_time,
+                        consulate=self.consulate, error_type=type(error).__name__)
             raise BookingNotVerified("Booking verification failed after submission; guard retained. Check the portal manually.") from error
         audit.event("booking_verification", verified=verified, date=day, time=slot_time, consulate=self.consulate)
         if verified:

@@ -25,7 +25,7 @@ async function busy(button, action) {
 }
 function showToken(result) {
   if (!result.token) { notice("This request has already completed. If you did not save the token, generate a new one."); return; }
-  $("configuration").value = `MODE=coordinated\nSERVER_URL=${result.connection.serverUrl}\nNODE_TOKEN=${result.token}\nNODE_MIN_DATE=YYYY-MM-DD\nUSER_CONSULATE=${document.body.dataset.city}\n`;
+  $("configuration").value = `MODE=coordinated\nSERVER_URL=${result.connection.serverUrl}\nNODE_TOKEN=${result.token}\nUSER_CONSULATE=${document.body.dataset.city}\n`;
   $("token-panel").classList.remove("hidden");
   $("token-panel").scrollIntoView({behavior: "smooth", block: "nearest"});
 }

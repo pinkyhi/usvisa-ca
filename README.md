@@ -84,8 +84,8 @@ python reschedule.py
 
 Selenium only signs in and hands off cookies; Chrome then closes. `requests`
 discovers the application, follows setup links and completes consent screens,
-checks availability, submits the booking and verifies
-the saved date, time and consulate. `TEST_MODE=true` (default) prepares the form
+prepares reusable booking fields and CSRF in memory, checks availability, submits the booking and verifies
+the saved date, time and consulate. Once a date is found, the ready session requests its available times and submits without reloading the form. Restored sessions also prepare the form before polling; expired authentication or a changed application discards it. The selected time still comes from the live times endpoint. When multiple times are available, one is selected randomly. The client submits once, waits for the response and verifies the saved appointment; it does not try other times after a POST. `TEST_MODE=true` (default) prepares the form
 without submitting it; set `TEST_MODE=false` in `.env` for real booking.
 An unverified booking stops the script for manual checking.
 
@@ -175,7 +175,7 @@ python scripts/server.py up --server-only
 python scripts/server.py create-user --username admin
 ```
 
-Open the displayed HTTPS URL, sign in, create a node, and save its token/configuration. Install `python -m pip install -e ".[node,coordinated]"` on each Node, fill its local visa settings, set `MODE=coordinated`, `SERVER_URL`, `NODE_TOKEN`, and `NODE_MIN_DATE`, then launch it. Each node polls every 180 seconds with evenly spaced phases (90 seconds apart for two nodes). Heartbeats and delivery run independently of the visa worker. Use `TEST_MODE=true` for the first run.
+Open the displayed HTTPS URL, sign in, create a node, and save its token/configuration. Install `python -m pip install -e ".[node,coordinated]"` on each Node, fill its local visa settings and acceptable date range, set `MODE=coordinated`, `SERVER_URL`, and `NODE_TOKEN`, then launch it. The exclusive notification cutoff defaults to `LATEST_ACCEPTABLE_DATE + 1 day`, so findings on the last acceptable day are included; `NODE_MIN_DATE` is an optional override. Each node polls every 180 seconds with evenly spaced phases (90 seconds apart for two nodes). Heartbeats and delivery run independently of the visa worker. Use `TEST_MODE=true` for the first run.
 
 After a verified real booking, the node prints a green uppercase success message and saves a booking stop in its local SQLite state. Coordinated monitoring, heartbeats and sharing continue, while further booking from either local checks or received findings stays disabled across restarts. The booked date is excluded from future findings. Dry runs do not set this stop and keep polling. Solo mode exits after success; an uncertain booking outcome retains the submission guard and stops for manual verification.
 
@@ -235,6 +235,6 @@ not recorded. Audit writes are flushed to disk; a write failure stops execution.
 The submission marker is kept independently of the audit log.
 
 The flow is: restore session or sign in ? discover application and prepare form
-? fetch and filter dates ? fetch fresh form and available times ? choose earliest
+? retain the prepared form in memory ? fetch and filter dates ? fetch available times ? choose one random
 time ? dry-run exit, or persist guard and submit once ? verify the saved date,
 time and consulate ? notify and exit. Unknown outcomes require manual checking.
