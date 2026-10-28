@@ -1,4 +1,4 @@
-"""Sequential visa worker with an independent durable Coordinator connection."""
+"""Scheduled visa worker with independent Coordinator delivery."""
 import math
 import os
 import time
@@ -11,11 +11,13 @@ from usvisa.shared.paths import data_directory
 from usvisa.transport.webstomp import WebStomp, parse_token
 from usvisa.visa.appointment_client import (
     AppointmentClient, AuthenticationExpired, BookingNotVerified, PortalError, RateLimited, acceptable_dates,
+    BookingPending,
 )
 from usvisa.visa.session_cache import SessionCache
 from . import settings as cfg
 from . import solo
 from .bootstrap import resolve_origin
+from .booking_state import migrate_legacy
 from .state import InstanceLock, NodeState
 from .telemetry import Telemetry
 
@@ -53,7 +55,7 @@ class Backoff:
     def reset(self):
         self.delay = cfg.RATE_LIMIT_BACKOFF_INITIAL_DELAY
 
-    def wait(self, error):
+    def schedule(self, error):
         enabled = all(value > 0 for value in (cfg.RATE_LIMIT_BACKOFF_INITIAL_DELAY,
                        cfg.RATE_LIMIT_BACKOFF_MAX_DELAY, cfg.RATE_LIMIT_BACKOFF_MULTIPLIER))
         if enabled and self.delay > cfg.RATE_LIMIT_BACKOFF_MAX_DELAY:
@@ -65,6 +67,10 @@ class Backoff:
         until = max(self.state.get("cooldown", 0), time.time() + delay)
         self.state.set("cooldown", until)
         solo.log_message(f"Rate limited; next worker operation in at least {delay:g} seconds")
+        return until
+
+    def wait(self, error):
+        until = self.schedule(error)
         self.stop.wait(max(0, until - time.time()))
 
 
@@ -129,7 +135,30 @@ class Worker:
         self.stop = transport.stopping
         self.backoff = Backoff(state, self.stop)
         self.minimum_monotonic = 0
-        self.verified_booking = self.state.get("verified_booking")
+        self.booking = None
+        self.application_id = None
+        self.guard_checked = None
+
+    def restore_guard(self, client):
+        identity = getattr(client, "schedule_id", None)
+        if not isinstance(identity, (str, int)):
+            return
+        if self.guard_checked is client:
+            was_blocked = bool(self.booking)
+            self.booking = audit.read_claim(identity)
+            if was_blocked != bool(self.booking):
+                self.transport.refresh_heartbeat()
+            return
+        self.booking = migrate_legacy(self.state, identity, cfg.USER_CONSULATE)
+        self.application_id = identity
+        self.state.set("booking_application_id", str(identity))
+        self.guard_checked = client
+        self.transport.refresh_heartbeat()
+        if self.booking:
+            solo.log_message(f"AUTOMATIC BOOKING BLOCKED: {self.booking.get('state', 'pending')}; monitoring and sharing continue")
+
+    def close(self):
+        pass
 
     def notify(self, result):
         try:
@@ -142,57 +171,66 @@ class Worker:
         except Exception as error:
             solo.log_message(f"Notification failed ({type(error).__name__}); finding remains in local outbox")
 
-    def report(self, dates, observed, exclude):
+    def report(self, dates, observed):
         snapshot = self.state.snapshot()
-        if not snapshot:
+        if not snapshot or snapshot.data.report_before is None or observed + timedelta(seconds=180) <= now():
             return
-        useful = tuple(sorted({day for day in dates if day < snapshot.data.report_before and day not in exclude}))
-        expires = observed + timedelta(seconds=180)
-        if useful and expires > now():
-            message = Message.create(SlotsFound(self.state.node_id, observed, useful), sent_at=now())
-            self.state.add_finding(message, expires)
+        useful = tuple(sorted({day for day in dates if day < snapshot.data.report_before}))
+        if not useful:
+            return
+        message = Message.create(SlotsFound(self.state.node_id, observed, useful), sent_at=now())
+        self.state.add_finding(message, observed + timedelta(seconds=180))
 
     @audit.traced("reschedule", log_group="reschedule", expected=(RateLimited, AuthenticationExpired))
     def try_dates(self, client, dates, *, observed=None, expires=None):
-        excluded, result = set(), None
-        if self.verified_booking:
-            excluded.add(date.fromisoformat(self.verified_booking["date"]))
+        if observed is not None:
+            self.report(dates, observed)
+        self.restore_guard(client)
+        if cfg.MODE == "coordinated-passive" or self.booking:
+            return None
+        result = None
         candidates = acceptable_dates(dates, date.fromisoformat(cfg.EARLIEST_ACCEPTABLE_DATE),
                                      date.fromisoformat(cfg.LATEST_ACCEPTABLE_DATE),
                                      [(date.fromisoformat(start), date.fromisoformat(end))
                                       for start, end in cfg.EXCLUSION_DATE_RANGES])
         audit.event("availability_filtered", available=dates, candidates=candidates,
                     earliest=cfg.EARLIEST_ACCEPTABLE_DATE, latest=cfg.LATEST_ACCEPTABLE_DATE,
-                    exclusions=cfg.EXCLUSION_DATE_RANGES, booking_disabled=bool(self.verified_booking))
-        try:
-            if self.verified_booking:
-                return None
-            for day in candidates:
-                if self.stop.is_set():
-                    break
-                if expires is not None and now() >= expires:
-                    break
+                    exclusions=cfg.EXCLUSION_DATE_RANGES, booking_disabled=bool(self.booking))
+        if self.booking:
+            return None
+        for day in candidates:
+            if self.stop.is_set():
+                break
+            if expires is not None and now() >= expires:
+                break
+            try:
+                result = client.book(day, dry_run=cfg.TEST_MODE,
+                                     **({"expires_at": expires} if expires else {}))
+            except BookingNotVerified as error:
+                # File state is authoritative; a preparation/persistence
+                # failure without a POST only pauses this worker in memory.
+                self.booking = (audit.read_claim(self.application_id) if self.application_id else None) or {
+                    "state": "pending", "date": str(error.day or day), "time": error.slot_time}
+                audit.exception("operation_exception", error)
+                solo.log_message("AUTOMATIC BOOKING BLOCKED: result requires verification; monitoring and sharing continue")
                 try:
-                    result = client.book(day, dry_run=cfg.TEST_MODE, **({"expires_at": expires} if expires else {}))
-                except BookingNotVerified:
-                    excluded.add(day)
-                    raise
-                if result:
-                    if not result.dry_run:
-                        excluded.add(result.date)
-                        # Commit before reporting/email: a restart or notification
-                        # failure must not re-enable automatic booking.
-                        verified = {"date": result.date.isoformat(), "time": result.time}
-                        self.state.set("verified_booking", verified)
-                        self.verified_booking = verified
-                        solo.log_booking_success(result)
-                        solo.log_message("Coordinated monitoring continues; further automatic booking is disabled")
-                    break
-        finally:
-            # Persist before notification/exit, including dates outside our own
-            # filters. Received tasks are never relayed back to the Coordinator.
-            if observed is not None:
-                self.report(dates, observed, excluded)
+                    solo.send_notification("Visa booking needs manual verification", str(error))
+                except Exception:
+                    solo.log_message("Booking verification notification could not be delivered")
+                break
+            if isinstance(result, BookingPending):
+                self.booking = (audit.read_claim(self.application_id) if self.application_id else None) or {
+                    "state": "pending", "date": result.date.isoformat(), "time": result.time}
+                solo.warn_booking_block(self.application_id)
+                self.transport.refresh_heartbeat()
+                result = None
+                break
+            if result:
+                if not result.dry_run:
+                    # Commit before reporting/email: a restart or notification
+                    # failure must not re-enable automatic booking.
+                    raise RuntimeError("A real booking must return blocked submission state")
+                break
         if result:
             if result.dry_run:
                 solo.log_message(f"TEST: would book {result.date} at {result.time}; no booking POST was sent")
@@ -201,6 +239,9 @@ class Worker:
 
     @audit.traced("poll", expected=(RateLimited, AuthenticationExpired))
     def poll(self, client):
+        self.restore_guard(client)
+        if self.booking and self.application_id:
+            solo.warn_booking_block(self.application_id)
         started = time.time()
         self.minimum_monotonic = time.monotonic() + 180
         self.state.set("last_check", started)
@@ -239,9 +280,11 @@ class Worker:
                 self.state.set("cooldown", max(self.state.get("cooldown", 0), time.time() + cfg.DATE_REQUEST_CYCLE_GAP))
 
     def loop(self, client):
+        self.restore_guard(client)
         due, revision = None, None
         announced_cooldown = None
         while not self.stop.is_set():
+            self.state.work_available.clear()
             current = time.time()
             cooldown = self.state.get("cooldown", 0)
             if current < cooldown:
@@ -250,6 +293,9 @@ class Worker:
                     announced_cooldown = cooldown
                 self.stop.wait(min(.5, cooldown - current))
                 due = None
+                continue
+            self.restore_guard(client)
+            if time.time() < self.state.get("cooldown", 0):
                 continue
             task = self.state.next_task(now())
             if task:
@@ -273,7 +319,7 @@ class Worker:
                 continue
             snapshot = self.state.snapshot()
             if not snapshot:
-                self.stop.wait(.2)
+                self.state.work_available.wait(.2)
                 continue
             if due is None or snapshot.data.revision != revision:
                 earliest = max(self.state.get("last_check", 0) + 180,
@@ -282,7 +328,7 @@ class Worker:
                 revision = snapshot.data.revision
                 solo.log_message(f"Next date check at {utc_time(due)} (schedule revision {revision})")
             if current < due:
-                self.stop.wait(min(.2, due - current))
+                self.state.work_available.wait(min(.2, due - current))
                 continue
             if current > due + 1:
                 due = None
@@ -298,9 +344,6 @@ class Worker:
             raise ValueError(self.transport.fatal)
 
     def run(self):
-        if self.verified_booking:
-            solo.log_message(f"Automatic booking remains disabled after verified appointment "
-                             f"{self.verified_booking['date']} at {self.verified_booking['time']}; monitoring continues")
         while not self.stop.is_set():
             if self.state.snapshot() is None or self.state.logging_config() is None:
                 self.stop.wait(.2)
@@ -333,7 +376,8 @@ def main(*, check_only=False):
         cfg.validate_settings()
         token = os.environ.get("NODE_TOKEN", "")
         node_id, _ = parse_token(token)
-        min_date = date.fromisoformat(os.environ.get("NODE_MIN_DATE", ""))
+        min_date = (None if cfg.MODE == "coordinated-passive" else
+                    date.fromisoformat(os.environ.get("NODE_MIN_DATE", "")))
     except ValueError as error:
         solo.log_message(f"Invalid coordinated configuration: {error}")
         return 2
@@ -344,17 +388,19 @@ def main(*, check_only=False):
     except RuntimeError as error:
         solo.log_message(str(error))
         return 2
-    state = transport = unsubscribe = None
+    state = transport = unsubscribe = worker = None
     code = 0
     try:
         state = NodeState(directory / "state.sqlite3", node_id, group)
         unsubscribe = audit.subscribe(Telemetry(state))
         transport = WebStomp(os.environ.get("SERVER_URL", ""), token, min_date, state,
                             allow_local=os.getenv("ALLOW_INSECURE_LOCALHOST", "false").lower() == "true",
+                            passive_provider=lambda: cfg.MODE == "coordinated-passive" or
+                                bool(state.get("booking_application_id") and audit.read_claim(state.get("booking_application_id"))),
                             **({"origin_provider": resolve_origin}
                                if os.getenv("EXPOSE_MODE") == "cloudflare_quick" and os.getenv("QUICK_TUNNEL_METRICS") else {}))
-        audit.event("run_started", mode="coordinated", node_id=node_id, test_mode=cfg.TEST_MODE)
-        solo.log_message(f"Node starting: mode=coordinated, nodeId={node_id}, city={group.city}, "
+        audit.event("run_started", mode=cfg.MODE, node_id=node_id, test_mode=cfg.TEST_MODE)
+        solo.log_message(f"Node starting: mode={cfg.MODE}, nodeId={node_id}, city={group.city}, "
                          f"minDate={min_date}, testMode={cfg.TEST_MODE}")
         saved = state.snapshot()
         if saved:
@@ -375,7 +421,8 @@ def main(*, check_only=False):
             if transport.fatal:
                 raise ValueError(transport.fatal)
         else:
-            Worker(state, transport).run()
+            worker = Worker(state, transport)
+            worker.run()
     except KeyboardInterrupt:
         solo.log_message("Stopped by user")
     except Exception as error:
@@ -391,6 +438,8 @@ def main(*, check_only=False):
             except Exception:
                 solo.log_message("Stop notification could not be delivered")
     finally:
+        if worker:
+            worker.close()
         if transport:
             # A finite flush; unconfirmed findings remain durable for next run.
             deadline = time.monotonic() + 5
@@ -402,5 +451,5 @@ def main(*, check_only=False):
         if state:
             state.close()
         lock.close()
-    audit.event("run_finished", mode="coordinated", exit_code=code)
+    audit.event("run_finished", mode=cfg.MODE, exit_code=code)
     return code

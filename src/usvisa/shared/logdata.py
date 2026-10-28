@@ -6,11 +6,12 @@ from urllib.parse import urlsplit, urlunsplit
 
 
 DETAIL_FIELDS = frozenset({
-    "dates", "times", "date", "time", "count", "earliest", "latest", "available", "candidates",
+    "dates", "times", "slots", "excluded_slots", "date", "time", "count", "earliest", "latest", "available", "candidates",
     "exclusions", "status", "method", "endpoint", "elapsed_ms", "duration_ms", "source",
     "finding_id", "booking_post_sent", "verified", "outcome", "reason", "prepared_form_cached",
     "applicant_count", "test_mode", "dry_run", "consulate", "matches", "booking_disabled",
     "error_type", "message", "stack", "truncated",
+    "response_messages", "response_location", "response_type", "response_bytes",
 })
 
 
@@ -48,17 +49,17 @@ def safe_details(details, secrets=()):
         if isinstance(item, (list, tuple)):
             return [value(part, depth + 1) for part in item[:366]]
         if isinstance(item, dict):
-            # Nested objects are used only for stack frames.
+            # Nested objects contain stack frames or prepared date/time pairs.
             return {key: value(part, depth + 1) for key, part in item.items()
-                    if key in {"file", "function", "line"}}
+                    if key in {"file", "function", "line", "date", "time"}}
         return safe_text(item, secrets)
 
-    arrays = {"dates", "times", "available", "candidates", "exclusions", "stack"}
+    arrays = {"dates", "times", "slots", "excluded_slots", "available", "candidates", "exclusions", "stack", "response_messages"}
     result = {key: value(item) for key, item in details.items() if key in DETAIL_FIELDS
               and (key not in arrays or isinstance(item, (list, tuple)))}
     if "count" in result and (type(result["count"]) is not int or result["count"] < 0):
         del result["count"]
     if len(json.dumps(result, ensure_ascii=True).encode()) > 16_000:
-        result = {key: part for key, part in result.items() if key not in {"dates", "times", "stack", "available"}}
+        result = {key: part for key, part in result.items() if key not in {"dates", "times", "slots", "stack", "available"}}
         result["truncated"] = True
     return result

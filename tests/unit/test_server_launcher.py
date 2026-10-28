@@ -67,3 +67,23 @@ class ServerLauncherTests(unittest.TestCase):
         commands = self.coordinated_up(False)
         self.assertEqual(commands[-1][-4:], ["up", "-d", "--build", "node"])
         self.assertIn("rabbitmq", commands[0])
+
+    def test_passive_setup_keeps_passive_mode_in_node_configuration(self):
+        (self.root / ".env").write_text("USER_CONSULATE=Calgary\nUSER_PASSWORD=keep-this\n")
+        self.assertEqual(self.run_command("setup", "--mode", "coordinated-passive"), 0)
+        body = server.read_env(self.root / ".env")
+        self.assertEqual(body["MODE"], "coordinated-passive")
+        self.assertEqual(body["USER_PASSWORD"], "keep-this")
+
+    def test_passive_up_starts_infrastructure_and_node_with_passive_profiles(self):
+        (self.root / ".env").write_text("MODE=coordinated-passive\n")
+        server.save_env(self.root / ".server.env", {"EXPOSE_MODE": "cloudflare_quick",
+            "PUBLIC_BASE_URL": "https://pending.trycloudflare.com"})
+        result = SimpleNamespace(returncode=0, stdout="https://unit-tunnel.trycloudflare.com", stderr="")
+        with patch("subprocess.run", return_value=result) as run, patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value.status = 200
+            self.assertEqual(self.run_command("up"), 0)
+        self.assertEqual(run.call_args.kwargs["env"]["MODE"], "coordinated-passive")
+        self.assertEqual(run.call_args.kwargs["env"]["COMPOSE_PROFILES"],
+                         "coordinated-passive,coordinated-passive-cloudflare_quick")
+        self.assertEqual(run.call_args.args[0][-4:], ["up", "-d", "--build", "node"])

@@ -107,6 +107,7 @@ class CoordinatedStackTests(unittest.TestCase):
             response = client.post("/api/v1/nodes", json={"name": name}, headers={"Idempotency-Key": str(uuid4())})
             self.assertEqual(response.status_code, 201, response.text)
             nodes.append(response.json())
+            self.addCleanup(lambda node=response.json(): client.post(f"/api/v1/nodes/{node['nodeId']}/revoke"))
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         states, transports = [], []
@@ -130,7 +131,7 @@ class CoordinatedStackTests(unittest.TestCase):
         entries = (
             LogEntry(uuid4(), observed, "poll", "info", "poll_completed", trace, None,
                      {"dates": ["2027-11-15"], "count": 1, "status": "success"}),
-            LogEntry(uuid4(), observed, "reschedule", "warning", "rate_limited", trace, "reschedule",
+            LogEntry(uuid4(), observed, "reschedule", "warning", "times_requested", trace, "reschedule",
                      {"status": 429, "endpoint": "/appointment/times/95.json"}),
             LogEntry(uuid4(), observed, "error", "error", "operation_exception", trace, "reschedule",
                      {"error_type": "PortalError", "message": "Isolated diagnostic fixture"}),
@@ -143,10 +144,29 @@ class CoordinatedStackTests(unittest.TestCase):
         event = client.get(f"/api/v1/logs/{activity[0]['id']}").json()
         self.assertEqual(len(event["trace"]), 3)
         self.assertEqual(len(client.get("/api/v1/logs", params={"view": "errors"}).json()["events"]), 1)
-        self.assertEqual(len(client.get("/api/v1/logs", params={"view": "reschedule"}).json()["events"]), 2)
+        self.assertEqual(len(client.get("/api/v1/logs", params={"view": "reschedule"}).json()["events"]), 1)
         states[0].add_telemetry(telemetry, observed + timedelta(days=7))
         until(lambda: not states[0].pending_telemetry(datetime.now(timezone.utc)))
         self.assertEqual(client.get("/api/v1/logs").json()["total"], 1)
+
+        # Full bodies larger than a broker message reassemble into one trace step.
+        from usvisa.node.telemetry import Telemetry
+        from usvisa.protocol.messages import NodeConfig
+        states[0].accept(Message.create(NodeConfig(states[0].node_id, uuid4(), False, ("reschedule",)),
+                                       sent_at=observed), now=observed)
+        body = "<html>" + "diagnostic-only-\u0434\u0430\u0442\u0430" * 10000 + "</html>"
+        Telemetry(states[0])({"timestamp": datetime.now(timezone.utc).isoformat(), "event_id": str(uuid4()),
+                            "trace_id": str(trace), "event": "booking_http_response", "log_group": "reschedule",
+                            "status": 302, "body": body})
+        until(lambda: not states[0].pending_telemetry(datetime.now(timezone.utc)))
+
+        def received_body():
+            detail = client.get(f"/api/v1/logs/{activity[0]['id']}").json()
+            return next((step for step in detail["trace"] if step["event"] == "booking_http_response"), None)
+
+        received = until(received_body)
+        self.assertEqual(received["details"]["body"], body)
+        self.assertEqual(len(client.get(f"/api/v1/logs/{activity[0]['id']}").json()["trace"]), 4)
 
         # Broker must prevent a second connection with the same credentials,
         # including Web STOMP (not just raw AMQP).
@@ -162,11 +182,82 @@ class CoordinatedStackTests(unittest.TestCase):
             extra.close()
             extra.shutdown()
 
+        # A passive visa worker uses the same real connection/schedule and
+        # publishes dates, while never asking for times or attempting booking.
+        from usvisa.node.coordinated import Worker
+        from usvisa.shared import audit
+        passive = Worker(states[0], transports[0])
+        self.addCleanup(passive.close)
+        visa = Mock(schedule_id="999999")
+        visa.get_available_dates.return_value = [date(2027, 11, 15)]
+        with patch.multiple("usvisa.node.coordinated.cfg", MODE="coordinated-passive", TEST_MODE=False,
+                DATE_REQUEST_CYCLE_LENGTH=0), patch("usvisa.node.coordinated.solo.log_message"), \
+                patch.multiple(audit, LOG_PATH=Path(directory.name) / "audit.jsonl",
+                               GUARD_DIR=Path(directory.name) / "guards"):
+            passive.poll(visa)
+        visa.book.assert_not_called()
+        visa.get_available_times.assert_not_called()
+        passive_task = until(lambda: states[1].next_task(datetime.now(timezone.utc)))
+        self.assertEqual(passive_task.data.dates, (date(2027, 11, 15),))
+        states[1].finish_task(passive_task.data.finding_id)
+
+        # Measure the real durable Node -> broker -> Coordinator -> broker ->
+        # recipient path without contacting the visa portal or sending a POST.
+        latencies = []
+        dates = (date(2027, 11, 15),)
+        for _ in range(20):
+            observation = datetime.now(timezone.utc)
+            packet = Message.create(SlotsFound(UUID(nodes[0]["nodeId"]), observation, dates), sent_at=observation)
+            states[1].work_available.clear()
+            started = time.perf_counter()
+            states[0].add_finding(packet, observation + timedelta(seconds=180))
+            deadline = time.monotonic() + 3
+            task = None
+            while task is None and time.monotonic() < deadline:
+                states[1].work_available.wait(.01)
+                task = states[1].next_task(datetime.now(timezone.utc))
+            self.assertIsNotNone(task, "Date finding was delayed or lost")
+            latencies.append(round((time.perf_counter() - started) * 1000, 2))
+            self.assertEqual(task.data.finding_id, packet.message_id)
+            self.assertEqual(task.data.dates, dates)
+            self.assertEqual(task.data.excluded_slots, ())
+            self.assertEqual(task.data.slots, ())
+            states[1].finish_task(task.data.finding_id)
+        measured = {"samples": len(latencies), "milliseconds": latencies,
+                    "medianMs": sorted(latencies)[len(latencies) // 2], "maxMs": max(latencies),
+                    "scope": "Loopback Docker, durable source outbox to durable recipient task; no visa HTTP"}
+        artifact = ROOT / "artifacts" / "date-findings-latency.json"
+        artifact.parent.mkdir(exist_ok=True)
+        artifact.write_text(json.dumps(measured, indent=2), encoding="utf-8")
+        print(f"Date finding delivery: median {measured['medianMs']}ms, max {measured['maxMs']}ms (20 local samples)")
+
+        # Passive peers keep their polling phases but neither receive findings
+        # nor contribute demand. A later manual reset restores active demand.
+        transports[1].passive_provider = lambda: True
+        transports[1].refresh_heartbeat()
+        until(lambda: states[0].snapshot().data.report_before == date(2027, 11, 1))
+        observation = datetime.now(timezone.utc)
+        passive_finding = Message.create(SlotsFound(UUID(nodes[0]["nodeId"]), observation,
+                                          (date(2027, 10, 15),)), sent_at=observation)
+        states[0].add_finding(passive_finding, observation + timedelta(seconds=180))
+        until(lambda: not states[0].pending(datetime.now(timezone.utc)))
+        until(lambda: any(event["event"] == "slots_found" and event["details"]["dates"] == ["2027-10-15"]
+                          for event in client.get("/api/v1/logs").json()["events"]))
+        self.assertIsNone(states[1].next_task(datetime.now(timezone.utc)))
+        transports[0].passive_provider = lambda: True
+        transports[0].refresh_heartbeat()
+        until(lambda: all(state.snapshot().data.report_before is None for state in states))
+        self.assertTrue(all(state.snapshot().data.start_at is not None for state in states))
+        for transport in transports:
+            transport.passive_provider = lambda: False
+            transport.refresh_heartbeat()
+        until(lambda: all(state.snapshot().data.report_before == date(2027, 12, 1) for state in states))
+
         # Recipient disconnects. Its durable queue must retain the finding over
         # a broker restart. A is the source; the date only matches B's minDate.
         transports[1].stop()
         observation = datetime.now(timezone.utc)
-        finding = Message.create(SlotsFound(UUID(nodes[0]["nodeId"]), observation, (date(2027, 11, 15),)), sent_at=observation)
+        finding = Message.create(SlotsFound(UUID(nodes[0]["nodeId"]), observation, dates), sent_at=observation)
         states[0].add_finding(finding, observation + timedelta(seconds=180))
         until(lambda: not states[0].pending(datetime.now(timezone.utc)))
         time.sleep(1)
@@ -177,6 +268,8 @@ class CoordinatedStackTests(unittest.TestCase):
         task = until(lambda: states[1].next_task(datetime.now(timezone.utc)), timeout=50)
         self.assertEqual(task.data.finding_id, finding.message_id)
         self.assertEqual(task.data.dates, (date(2027, 11, 15),))
+        self.assertEqual(task.data.excluded_slots, ())
+        self.assertEqual(task.data.slots, ())
         self.assertEqual(task.data.expires_at, observation + timedelta(seconds=180))
         self.assertIsNone(states[0].next_task(datetime.now(timezone.utc)))
         states[1].finish_task(task.data.finding_id)

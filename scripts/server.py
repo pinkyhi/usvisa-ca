@@ -50,7 +50,7 @@ def main():
     parser.add_argument("--project", default="usvisa")
     sub = parser.add_subparsers(dest="command", required=True)
     setup = sub.add_parser("setup")
-    setup.add_argument("--mode", choices=["solo", "coordinated"], default="coordinated")
+    setup.add_argument("--mode", choices=["solo", "coordinated", "coordinated-passive"], default="coordinated")
     setup.add_argument("--profile", choices=["tailscale", "cloudflare_quick", "cloudflare_domain"], default="cloudflare_quick")
     setup.add_argument("--url", help="HTTPS origin for Tailscale or your named tunnel")
     setup.add_argument("--port", type=int, default=8080)
@@ -58,7 +58,7 @@ def main():
     setup.add_argument("--city")
     setup.add_argument("--local-test", action="store_true", help="Explicit loopback-only HTTP test, never a public profile")
     up = sub.add_parser("up")
-    up.add_argument("--mode", choices=["solo", "coordinated"])
+    up.add_argument("--mode", choices=["solo", "coordinated", "coordinated-passive"])
     up.add_argument("--server-only", action="store_true", help="Start infrastructure without the visa worker")
     sub.add_parser("down")
     sub.add_parser("status")
@@ -129,8 +129,8 @@ def main():
         else:
             parser.error("Run setup first")
     profile = values["EXPOSE_MODE"]
-    if mode not in {"solo", "coordinated"}:
-        parser.error("MODE must be solo or coordinated")
+    if mode not in {"solo", "coordinated", "coordinated-passive"}:
+        parser.error("MODE must be solo, coordinated or coordinated-passive")
     if getattr(args, "mode", None) and args.env_file == ROOT / ".server.env":
         update_node_env({"MODE": mode})
     if values.get("CF_TUNNEL_TOKEN") and values.get("TUNNEL_TOKEN") != values["CF_TUNNEL_TOKEN"]:

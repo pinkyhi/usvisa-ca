@@ -5,7 +5,7 @@ from unittest.mock import Mock
 import requests
 
 from usvisa.visa.appointment_client import AppointmentClient, PortalError, AuthenticationExpired, RateLimited
-from tests.unit.test_booking import DAY, SAVED, NoNetworkTest, FORM, URL, response
+from tests.unit.test_booking import DAY, SAVED, NoNetworkTest, FORM, URL, response, saved_account
 
 
 ACCOUNT = "https://ais.usvisa-info.com/en-ca/niv"
@@ -34,13 +34,13 @@ class HttpSetupTests(NoNetworkTest):
         self.session.get.side_effect = [
             response(f'<a href="{URL}">Continue</a>', url=ACCOUNT), response(FORM),
             response(payload={"available_times": ["08:30"]}),
-            response(SAVED, url=URL + "/instructions"),
+            response(saved_account(SAVED), url=ACCOUNT),
         ]
         self.session.post.return_value = response(status=302)
         self.client.prepare_session()
-        self.assertFalse(self.client.book(DAY, dry_run=False).dry_run)
+        self.assertEqual(self.client.book(DAY, dry_run=False).date, DAY)
         self.assertEqual([call.args[0] for call in self.session.get.call_args_list],
-                         [ACCOUNT, URL, URL + "/times/95.json", URL + "/instructions"])
+                         [ACCOUNT, URL, URL + "/times/95.json"])
         self.session.post.assert_called_once()
 
     def test_group_continue_and_setup_links_use_http(self):

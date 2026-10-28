@@ -101,6 +101,8 @@
   .log-stat-small { font-size: 1rem; letter-spacing: -.01em; line-height: 2.34; }
   .log-chart-panel, .log-list-panel { padding: 1.5rem; margin-bottom: 1.5rem; }
   .log-section-heading { display: flex; align-items: start; justify-content: space-between; flex-wrap: wrap; gap: 1rem; margin-bottom: 1.5rem; }
+  .log-type-filter { display: grid; gap: .5rem; font-size: .75rem; font-weight: 600; max-width: 100%; }
+  .log-type-filter select { font-size: .875rem; max-width: 100%; }
   .log-legend { display: flex; flex-wrap: wrap; gap: .9rem; font-size: .65rem; color: var(--muted-foreground); }
   .log-legend span { display: flex; align-items: center; gap: .35rem; }
   .dot { width: .45rem; height: .45rem; border-radius: 50%; display: inline-block; }

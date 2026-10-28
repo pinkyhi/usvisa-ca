@@ -82,19 +82,19 @@ REQUEST_HEADERS = {"X-Requested-With": "XMLHttpRequest"}
 
 
 def validate_settings():
-    if MODE not in {"solo", "coordinated"}:
-        raise ValueError("MODE must be solo or coordinated")
-    missing = [name for name in (
-        "USER_EMAIL", "USER_PASSWORD", "USER_CONSULATE",
-        "EARLIEST_ACCEPTABLE_DATE", "LATEST_ACCEPTABLE_DATE",
-    ) if not globals()[name]]
+    if MODE not in {"solo", "coordinated", "coordinated-passive"}:
+        raise ValueError("MODE must be solo, coordinated or coordinated-passive")
+    required = ["USER_EMAIL", "USER_PASSWORD", "USER_CONSULATE"]
+    if MODE != "coordinated-passive":
+        required += ["EARLIEST_ACCEPTABLE_DATE", "LATEST_ACCEPTABLE_DATE"]
+    missing = [name for name in required if not globals()[name]]
     if missing:
         raise ValueError("Fill these settings in .env: " + ", ".join(missing))
     if USER_CONSULATE not in CONSULATES:
         raise ValueError("USER_CONSULATE must be one of: " + ", ".join(CONSULATES))
     try:
-        earliest = date.fromisoformat(EARLIEST_ACCEPTABLE_DATE)
-        latest = date.fromisoformat(LATEST_ACCEPTABLE_DATE)
+        earliest = date.min if MODE == "coordinated-passive" else date.fromisoformat(EARLIEST_ACCEPTABLE_DATE)
+        latest = date.max if MODE == "coordinated-passive" else date.fromisoformat(LATEST_ACCEPTABLE_DATE)
         exclusions = [(date.fromisoformat(start), date.fromisoformat(end))
                       for start, end in EXCLUSION_DATE_RANGES]
     except ValueError as error:

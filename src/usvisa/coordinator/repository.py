@@ -42,6 +42,9 @@ class NodeRecord:
     last_seen_at: datetime | None
     last_heartbeat_at: datetime | None
     start_at: datetime | None
+    slots_version: int = 0
+    date_exclusions: bool = False
+    passive: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,7 +79,7 @@ def _node(row) -> NodeRecord | None:
     return NodeRecord(UUID(row["node_id"]), row["username"], row["lifecycle"], bool(row["active"]),
                       date.fromisoformat(row["min_date"]) if row["min_date"] else None,
                       _datetime(row["last_seen_at"]), _datetime(row["last_heartbeat_at"]),
-                      _datetime(row["start_at"]))
+                      _datetime(row["start_at"]), row["slots_version"], bool(row["date_exclusions"]), bool(row["passive"]))
 
 
 class UnitOfWork:
@@ -113,10 +116,12 @@ class UnitOfWork:
             "INSERT OR IGNORE INTO schedule(singleton, revision, consulate_id, city) VALUES(1, 0, ?, ?)",
             (config.consulate_id, config.city))
 
-    def heartbeat(self, node_id: UUID, min_date: date, sent_at: datetime, seen_at: datetime) -> None:
+    def heartbeat(self, node_id: UUID, min_date: date | None, sent_at: datetime, seen_at: datetime,
+                  slots_version=0, date_exclusions=False, passive=False) -> None:
         self.connection.execute(
-            "UPDATE nodes SET active = 1, min_date = ?, last_heartbeat_at = ?, last_seen_at = ? "
-            "WHERE node_id = ?", (min_date.isoformat(), _ticks(sent_at), _ticks(seen_at), str(node_id)))
+            "UPDATE nodes SET active = 1, min_date = ?, last_heartbeat_at = ?, last_seen_at = ?, slots_version = ?, date_exclusions = ?, passive = ? "
+            "WHERE node_id = ?", (min_date.isoformat() if min_date else None, _ticks(sent_at), _ticks(seen_at),
+                                  slots_version, int(date_exclusions), int(passive), str(node_id)))
 
     def expire_members(self, cutoff: datetime) -> None:
         self.connection.execute("UPDATE nodes SET active = 0 WHERE active = 1 AND last_seen_at <= ?",
@@ -158,15 +163,18 @@ class UnitOfWork:
 
     def finding(self, node_id: UUID, message: Message, expires_at: datetime) -> None:
         self.connection.execute(
-            "INSERT INTO findings(node_id, message_id, observed_at, expires_at, dates) VALUES(?, ?, ?, ?, ?)",
+            "INSERT INTO findings(node_id, message_id, observed_at, expires_at, dates, slots, excluded_slots) VALUES(?, ?, ?, ?, ?, ?, ?)",
             (str(node_id), str(message.message_id), _ticks(message.data.observed_at), _ticks(expires_at),
-             json.dumps([day.isoformat() for day in message.data.dates])))
+             json.dumps([day.isoformat() for day in message.data.dates]),
+             json.dumps([slot.to_dict() for slot in message.data.slots]),
+             json.dumps([slot.to_dict() for slot in message.data.excluded_slots])))
 
     def cancel_outbox(self, now: datetime) -> None:
         self.connection.execute(
             "UPDATE outbox SET status = 'cancelled' WHERE status = 'pending' AND "
             "((expires_at IS NOT NULL AND expires_at <= ?) OR node_id IN "
-            "(SELECT node_id FROM nodes WHERE lifecycle = 'revoked'))", (_ticks(now),))
+            "(SELECT node_id FROM nodes WHERE lifecycle = 'revoked') OR "
+            "(exchange='visa.slots' AND node_id IN (SELECT node_id FROM nodes WHERE passive=1)))", (_ticks(now),))
 
 
 _SCHEMA = (
@@ -226,12 +234,13 @@ class Repository:
                                             check_same_thread=False, timeout=10)
         self._connection.row_factory = sqlite3.Row
         try:
-            self._connection.execute("PRAGMA foreign_keys = ON")
+            # A transactional table rebuild preserves references during migration.
+            self._connection.execute("PRAGMA foreign_keys = OFF")
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._connection.execute("PRAGMA synchronous = FULL")
             with self.transaction() as work:
                 version = work.connection.execute("PRAGMA user_version").fetchone()[0]
-                if version not in (0, 1, 2, 3, 4):
+                if version not in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9):
                     raise ValueError("Unsupported Coordinator database version")
                 if version == 0:
                     for statement in _SCHEMA:
@@ -244,7 +253,42 @@ class Repository:
                 if version < 4:
                     from .logs import migrate
                     migrate(work.connection)
-                    work.connection.execute("PRAGMA user_version = 4")
+                if version < 5:
+                    from .logs import retention_indexes
+                    retention_indexes(work.connection)
+                    work.connection.execute("PRAGMA user_version = 5")
+                if version < 6:
+                    work.connection.execute("ALTER TABLE nodes ADD COLUMN slots_version INTEGER NOT NULL DEFAULT 0 CHECK(slots_version IN (0,1))")
+                    work.connection.execute("ALTER TABLE findings ADD COLUMN slots TEXT NOT NULL DEFAULT '[]'")
+                    work.connection.execute("PRAGMA user_version = 6")
+                if version < 7:
+                    work.connection.execute("ALTER TABLE nodes ADD COLUMN date_exclusions INTEGER NOT NULL DEFAULT 0 CHECK(date_exclusions IN (0,1))")
+                    work.connection.execute("ALTER TABLE findings ADD COLUMN excluded_slots TEXT NOT NULL DEFAULT '[]'")
+                    work.connection.execute("PRAGMA user_version = 7")
+                if version < 8:
+                    from .logs import migrate_bodies
+                    migrate_bodies(work.connection)
+                    work.connection.execute("PRAGMA user_version = 8")
+                if version < 9:
+                    db = work.connection
+                    db.execute("""CREATE TABLE nodes_new(
+                        node_id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                        lifecycle TEXT NOT NULL CHECK(lifecycle IN ('provisioning','ready','revoked')),
+                        active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+                        min_date TEXT, last_seen_at INTEGER, last_heartbeat_at INTEGER, start_at INTEGER,
+                        slots_version INTEGER NOT NULL DEFAULT 0 CHECK(slots_version IN (0,1)),
+                        date_exclusions INTEGER NOT NULL DEFAULT 0 CHECK(date_exclusions IN (0,1)),
+                        passive INTEGER NOT NULL DEFAULT 0 CHECK(passive IN (0,1)),
+                        CHECK(active=0 OR (lifecycle='ready' AND last_seen_at IS NOT NULL
+                              AND (passive=1 OR min_date IS NOT NULL))))""")
+                    db.execute("INSERT INTO nodes_new SELECT node_id,username,lifecycle,active,min_date,last_seen_at,"
+                               "last_heartbeat_at,start_at,slots_version,date_exclusions,0 FROM nodes")
+                    db.execute("DROP TABLE nodes")
+                    db.execute("ALTER TABLE nodes_new RENAME TO nodes")
+                    db.execute("PRAGMA user_version = 9")
+                if work.connection.execute("PRAGMA foreign_key_check").fetchone():
+                    raise ValueError("Coordinator migration failed foreign key verification")
+            self._connection.execute("PRAGMA foreign_keys = ON")
         except BaseException:
             self._connection.close()
             raise
@@ -325,7 +369,7 @@ class Repository:
                 "config": state.config.to_dict() if state else None,
                 "reportBefore": state.report_before.isoformat() if state and state.report_before else None,
                 "nodes": [{"nodeId": str(node.node_id), "lifecycle": node.lifecycle, "active": node.active,
-                           "minDate": node.min_date.isoformat() if node.min_date else None,
+                           "minDate": node.min_date.isoformat() if node.min_date else None, "passive": node.passive,
                            "lastSeenAt": timestamp(node.last_seen_at) if node.last_seen_at else None,
                            "startAt": timestamp(node.start_at) if node.start_at else None}
                           for node in work.nodes()],

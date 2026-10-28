@@ -40,7 +40,8 @@ class RateLimitTests(IsolatedLogsTest):
             "https://ais.usvisa-info.com/en-ca/niv/schedule/123/appointment",
             95, "Vancouver")
         with patch.object(client, "_get", side_effect=RateLimited("600")) as get:
-            self.assertFalse(client.verify_booking(date(2026, 11, 12), "08:30"))
+            with self.assertRaises(RateLimited):
+                client.verify_booking(date(2026, 11, 12), "08:30")
         get.assert_called_once()
 
     def test_retry_after_date_and_invalid_values(self):

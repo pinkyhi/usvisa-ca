@@ -75,6 +75,8 @@ class BrokerRuntime:
         self.ready = False
         self.connection = None
         self.tasks = []
+        self.publish_ready = asyncio.Event()
+        self.publish_limit = asyncio.Semaphore(16)
 
     async def start(self):
         self.connection = await aio_pika.connect_robust(self.config.amqp_url, timeout=15, heartbeat=20)
@@ -130,41 +132,54 @@ class BrokerRuntime:
             await asyncio.sleep(1)
             return
         await incoming.ack()
+        self.publish_ready.set()
+
+    async def publish_entry(self, entry):
+        async with self.publish_limit:
+            remaining = entry.expiration_ms(datetime.now(timezone.utc))
+            if remaining == 0:
+                return
+            event = entry.message
+            await self.exchanges[entry.exchange].publish(aio_pika.Message(
+                event.to_json().encode("utf-8"), content_type="application/json",
+                delivery_mode=aio_pika.DeliveryMode.PERSISTENT, message_id=str(event.message_id),
+                type=event.type, user_id=self.config.broker_user,
+                expiration=remaining / 1000 if remaining is not None else None),
+                routing_key=entry.routing_key, mandatory=True, timeout=15)
+            self.repository.mark_published(event.message_id)
+            details = {}
+            if isinstance(event.data, ScheduleUpdated):
+                details = {"revision": event.data.revision, "scheduleVersion": event.data.schedule_version,
+                           "startAt": event.data.start_at, "intervalSeconds": event.data.interval_seconds}
+            elif isinstance(event.data, SlotsAvailable):
+                details = {"findingId": event.data.finding_id, "dates": event.data.dates}
+            log_event("Event published to RabbitMQ", nodeId=entry.node_id, messageId=event.message_id,
+                      eventType=event.type, **details)
 
     async def publish_loop(self):
         while True:
+            self.publish_ready.clear()
             try:
-                for entry in self.repository.pending(now=datetime.now(timezone.utc)):
-                    remaining = entry.expiration_ms(datetime.now(timezone.utc))
-                    if remaining == 0:
-                        continue
-                    event = entry.message
-                    await self.exchanges[entry.exchange].publish(aio_pika.Message(
-                        event.to_json().encode("utf-8"), content_type="application/json",
-                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT, message_id=str(event.message_id),
-                        type=event.type, user_id=self.config.broker_user,
-                        expiration=remaining / 1000 if remaining is not None else None),
-                        routing_key=entry.routing_key, mandatory=True, timeout=15)
-                    self.repository.mark_published(event.message_id)
-                    details = {}
-                    if isinstance(event.data, ScheduleUpdated):
-                        details = {"revision": event.data.revision, "scheduleVersion": event.data.schedule_version,
-                                   "startAt": event.data.start_at, "intervalSeconds": event.data.interval_seconds}
-                    elif isinstance(event.data, SlotsAvailable):
-                        details = {"findingId": event.data.finding_id, "dates": event.data.dates}
-                    log_event("Event published to RabbitMQ", nodeId=entry.node_id, messageId=event.message_id,
-                              eventType=event.type, **details)
+                results = await asyncio.gather(*(self.publish_entry(entry) for entry in
+                    self.repository.pending(now=datetime.now(timezone.utc))), return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        raise result
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 log.warning("Outbox publication deferred (%s)", type(error).__name__)
                 await asyncio.sleep(2)
-            await asyncio.sleep(.25)
+            try:
+                await asyncio.wait_for(self.publish_ready.wait(), timeout=.25)
+            except asyncio.TimeoutError:
+                pass
 
     async def presence_loop(self):
         while True:
             try:
                 self.service.expire(now=datetime.now(timezone.utc))
+                self.publish_ready.set()
             except Exception as error:
                 log.error("Presence transaction deferred (%s)", type(error).__name__)
             await asyncio.sleep(5)

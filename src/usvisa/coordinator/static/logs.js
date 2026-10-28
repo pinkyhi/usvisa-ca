@@ -1,15 +1,16 @@
 "use strict";
 (() => {
-  const state = {view: "activity", cursor: null, older: false, generation: 0, cache: new Map(), hovered: null};
+  const state = {view: "activity", cursor: null, older: false, generation: 0, cache: new Map(), hovered: null, listed: new Set()};
   const localTime = (value) => new Date(value).toLocaleString("en-US", {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit"});
   const title = (name) => name.replaceAll("_", " ").replace(/^./, c => c.toUpperCase());
+  const eventTitle = (row) => row.isTrace ? `Booking attempt · ${title(row.event)}` : title(row.event);
   function el(tag, text, className) {
     const node = document.createElement(tag); if (text !== undefined) node.textContent = text;
     if (className) node.className = className; return node;
   }
   function tone(row) {
     if (row.level === "error" || row.status === "failed") return "error";
-    if (row.level === "warning") return "warning";
+    if (row.level === "warning" || row.status === 429 || row.status === "rate_limited") return "warning";
     return row.count > 0 || row.category === "finding" || row.category === "reschedule" ? "slots" : "empty";
   }
   function summary(row) {
@@ -17,11 +18,14 @@
     if (data.message) return data.message;
     if (data.reason) return String(data.reason).replaceAll("_", " ");
     if (["rate_limited", "session_expired", "failed"].includes(data.status)) return title(data.status);
-    if (data.candidates) return `${data.candidates.length} candidate(s) from ${data.available?.length || 0} dates · ${data.booking_disabled ? "Booking disabled after verified appointment" : data.candidates.length ? "Within the configured date range" : "No dates match the configured range or exclusions"}`;
+    if (data.candidates) return `${data.candidates.length} candidate(s) from ${data.available?.length || 0} dates · ${data.booking_disabled ? "Automatic booking is blocked; monitoring continues" : data.candidates.length ? "Within the configured date range" : "No dates match the configured range or exclusions"}`;
     if (data.dates) return data.dates.length ? `${data.dates.length} date(s) · earliest ${data.dates[0]}` : "Portal returned empty array";
     if (data.times) return data.times.length ? `${data.times.length} time(s) · ${data.times.join(", ")}` : "No available appointment times";
+    if (row.event === "booking_no_times") return `${data.date} · No available appointment times`;
+    if (row.event === "booking_verification") return `${data.date} ${data.time || ""} · ${data.verified ? "Booking verified" : "Booking not verified"}`;
     if (data.outcome) return data.outcome;
     if (data.status !== undefined) return `Status: ${data.status}`;
+    if (data.date) return `${data.date}${data.time ? ` at ${data.time}` : ""}`;
     return data.earliest ? `Earliest: ${data.earliest}` : title(row.event);
   }
   async function details(id) {
@@ -59,7 +63,7 @@
   async function tooltip(row, x, y) {
     state.hovered = row.id;
     const tip = $("log-tooltip");
-    tip.replaceChildren(el("strong", `${row.nodeName} · ${row.owner}`), el("p", localTime(row.occurredAt)), el("p", title(row.event)));
+    tip.replaceChildren(el("strong", `${row.nodeName} · ${row.owner}`), el("p", localTime(row.occurredAt)), el("p", eventTitle(row)));
     tip.classList.remove("hidden");
     tip.style.left = `${Math.max(8, Math.min(x + 14, innerWidth - 350))}px`;
     tip.style.top = `${Math.max(8, Math.min(y + 14, innerHeight - 330))}px`;
@@ -78,15 +82,7 @@
   }
   function chart(data) {
     const container = $("log-chart"); container.replaceChildren();
-    let points = data.points;
-    if (state.view === "reschedule") {
-      const traces = new Map();
-      for (const point of points) {
-        const key = `${point.nodeId}:${point.traceId || point.id}`, old = traces.get(key);
-        if (!old || old.level !== "error") traces.set(key, point);
-      }
-      points = Array.from(traces.values());
-    }
+    const points = data.points;
     if (!points.length) { container.append(el("p", "No events in this time range. New activity appears automatically.", "empty-state")); return; }
     const ids = [...new Set(points.map(point => point.nodeId))];
     const width = 1000, left = 220, right = 24, top = 30, step = 62, height = top + ids.length * step + 40;
@@ -106,6 +102,10 @@
       name.append(svg("title", {}, label)); root.append(name);
       root.append(svg("line", {x1: left, x2: width - right, y1: y, y2: y, class: "chart-lane"}));
     });
+    // SVG paints in DOM order. Keep every non-empty point above empty points,
+    // including when zoomed out and their circles overlap on the same lane.
+    const emptyLayer = svg("g", {"data-layer": "empty"}), activeLayer = svg("g", {"data-layer": "active"});
+    root.append(emptyLayer, activeLayer);
     for (const point of points) {
       const x = left + (Date.parse(point.occurredAt) - start) / (end - start) * (width - left - right);
       const y = top + ids.indexOf(point.nodeId) * step + step / 2;
@@ -115,19 +115,23 @@
       dot.addEventListener("pointerleave", hideTip); dot.addEventListener("blur", hideTip);
       dot.addEventListener("click", () => { hideTip(); inspect(point.id); });
       dot.addEventListener("keydown", event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); inspect(point.id); } });
-      root.append(dot);
+      (tone(point) === "empty" ? emptyLayer : activeLayer).append(dot);
     }
     container.append(root);
   }
   function list(events, append) {
-    const container = $("log-list"); if (!append) container.replaceChildren();
+    const container = $("log-list"); if (!append) { container.replaceChildren(); state.listed.clear(); }
     if (!events.length && !append) { container.append(el("p", state.view === "errors" ? "No serious errors in this time range. Expected retries such as HTTP 429 are excluded." : "No events to display yet.", "empty-state")); return; }
     for (const row of events) {
+      const key = row.isTrace ? `${row.nodeId}:${row.traceId}` : row.id;
+      if (state.listed.has(key)) continue;
+      state.listed.add(key);
       const button = el("button", undefined, "log-row");
       const heading = el("div", undefined, "log-row-heading");
-      heading.append(el("span", title(row.event), "font-semibold"), el("span", localTime(row.occurredAt), "muted text-xs"));
+      heading.append(el("span", eventTitle(row), "font-semibold"), el("span", localTime(row.occurredAt), "muted text-xs"));
       const meta = el("div", undefined, "log-row-meta");
       meta.append(el("span", row.level.toUpperCase(), `log-level ${row.level}`), el("span", `${row.nodeName} · ${row.owner}`, "muted text-xs"));
+      if (row.isTrace) meta.append(el("span", `${row.stepCount} group step(s) · one trace`, "muted text-xs"));
       button.append(heading, meta, el("p", summary(row), "log-summary muted text-sm"));
       button.onclick = () => inspect(row.id); container.append(button);
     }
@@ -136,6 +140,8 @@
     const generation = ++state.generation;
     const params = new URLSearchParams({hours: $("log-hours").value, view: state.view});
     if ($("log-node").value) params.set("nodeId", $("log-node").value);
+    const selectedType = $("log-event-type").value;
+    if (selectedType) params.set("eventType", selectedType);
     if (append && state.cursor) params.set("before", state.cursor);
     $("log-refresh").disabled = true; $("log-more").disabled = true;
     try {
@@ -145,15 +151,21 @@
       $("log-node").replaceChildren(el("option", "All nodes")); $("log-node").firstChild.value = "";
       for (const node of data.nodes) { const option = el("option", `${node.name} · ${node.owner}`); option.value = node.nodeId; $("log-node").append(option); }
       $("log-node").value = selected;
+      const types = [...data.eventTypes];
+      if (selectedType && !types.includes(selectedType)) types.push(selectedType);
+      $("log-event-type").replaceChildren(el("option", "All event types")); $("log-event-type").firstChild.value = "";
+      for (const type of types) { const option = el("option", title(type)); option.value = type; $("log-event-type").append(option); }
+      $("log-event-type").value = selectedType;
+      $("log-total-label").textContent = state.view === "reschedule" ? "Booking attempts in range" : "Events in range";
       $("log-total").textContent = data.total.toLocaleString("en-US");
       $("log-node-count").textContent = new Set(data.points.map(row => row.nodeId)).size;
       $("log-latest").textContent = data.points.length ? localTime(data.points[data.points.length - 1].occurredAt) : "No events yet";
       $("log-chart-panel").classList.toggle("hidden", state.view === "errors");
       $("log-group-section").classList.toggle("hidden", state.view !== "reschedule");
       $("log-chart-title").textContent = state.view === "reschedule" ? "Reschedule traces" : "Activity timeline";
-      $("log-chart-hint").textContent = state.view === "reschedule" ? "Each point is a booking trace. Select it to inspect every step." : "Hover for details. Select a point to inspect its trace.";
-      $("log-list-title").textContent = state.view === "errors" ? "Serious errors" : state.view === "reschedule" ? "Reschedule event log" : "Event log";
-      $("log-chart-note").textContent = `${data.chartLimited ? "Showing the latest 3,000 events. Narrow the time range for more detail. " : ""}Times are shown in your browser’s local time.`;
+      $("log-chart-hint").textContent = state.view === "reschedule" ? "One point per booking attempt. Select it to inspect every step. Observations and dry runs are excluded." : "Hover for details. Select a point to inspect its trace.";
+      $("log-list-title").textContent = state.view === "errors" ? "Serious errors" : state.view === "reschedule" ? "Booking attempts" : "Event log";
+      $("log-chart-note").textContent = `${data.chartLimited ? "Showing the latest 3,000 entries. Narrow the time range for more detail. " : ""}History is kept for 7 days. Times are shown in your browser’s local time.`;
       chart(data); list(data.events, append);
       state.older = append;
       state.cursor = data.nextCursor; $("log-more").classList.toggle("hidden", !state.cursor);
@@ -165,11 +177,13 @@
   async function initializeLogs() {
     const user = await api("/me"); $("log-scope").textContent = user.canViewAllLogs ? "All nodes · admin view" : "Your nodes";
     $("log-node").onchange = () => load(); $("log-hours").onchange = () => load();
+    $("log-event-type").onchange = () => load();
     $("log-refresh").onclick = () => load(); $("log-more").onclick = () => load(true);
     $("log-detail-close").onclick = () => $("log-detail").close();
     $("log-detail").addEventListener("click", event => { if (event.target === $("log-detail")) { const rect = event.target.getBoundingClientRect(); if (event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom) event.target.close(); } });
     for (const tab of document.querySelectorAll("[data-log-view]")) tab.onclick = () => {
       state.view = tab.dataset.logView; state.cursor = null;
+      $("log-event-type").value = "";
       for (const other of document.querySelectorAll("[data-log-view]")) other.setAttribute("aria-selected", String(other === tab));
       hideTip(); load();
     };

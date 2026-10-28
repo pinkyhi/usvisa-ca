@@ -89,6 +89,10 @@ class PortalTests(unittest.TestCase):
                 work.connection.execute("INSERT INTO portal_nodes(node_id, owner_id, name) VALUES(?, ?, ?)",
                                         (str(node_id), owner, "Existing computer"))
                 work.connection.execute("ALTER TABLE users RENAME COLUMN username TO email")
+                work.connection.execute("ALTER TABLE nodes DROP COLUMN date_exclusions")
+                work.connection.execute("ALTER TABLE findings DROP COLUMN excluded_slots")
+                work.connection.execute("ALTER TABLE nodes DROP COLUMN slots_version")
+                work.connection.execute("ALTER TABLE findings DROP COLUMN slots")
                 work.connection.execute("PRAGMA user_version = 2")
         with Repository(legacy_path) as migrated:
             account = session_user(migrated, user["session"])
@@ -96,7 +100,7 @@ class PortalTests(unittest.TestCase):
             self.assertEqual(account["user_id"], owner)
             self.assertEqual(authenticate(migrated, "owner@example.com", "legacy-password", "migration-test")[0], "ok")
             with migrated.transaction() as work:
-                self.assertEqual(work.connection.execute("PRAGMA user_version").fetchone()[0], 4)
+                self.assertEqual(work.connection.execute("PRAGMA user_version").fetchone()[0], 9)
                 self.assertEqual(work.connection.execute("SELECT owner_id FROM portal_nodes WHERE node_id=?",
                                                         (str(node_id),)).fetchone()[0], owner)
                 self.assertEqual(work.connection.execute("PRAGMA foreign_key_check").fetchall(), [])

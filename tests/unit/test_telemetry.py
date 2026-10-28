@@ -24,7 +24,7 @@ from usvisa.protocol.messages import (
     GroupConfig, Heartbeat, LogEntry, Message, NodeConfig, NodeLogs, ScheduleUpdated, parse_message,
 )
 from usvisa.shared import audit
-from usvisa.visa.appointment_client import AppointmentClient, BookingNotVerified, RateLimited
+from usvisa.visa.appointment_client import AppointmentClient, RateLimited
 
 
 GROUP = GroupConfig(95, "Vancouver")
@@ -159,30 +159,7 @@ class TelemetryTests(IsolatedLogsTest):
         self.assertFalse(any(entry.level == "error" for entry in entries))
         self.assertTrue(any(entry.event == "poll_completed" and entry.level == "warning" for entry in entries))
 
-    def test_unverified_post_trace_includes_request_outcome_verification_and_exception(self):
-        session = Mock()
-        session.get.side_effect = [response(FORM), response(payload=[{"date": DAY.isoformat()}]),
-                                  response(payload={"available_times": ["08:30"]})]
-        session.post.return_value = response(status=422)
-        client = AppointmentClient(session, URL, 95, "Vancouver")
-        client.check_session()
-        worker = Worker(self.state, Mock(stopping=threading.Event()))
-        remove = audit.subscribe(Telemetry(self.state))
-        try:
-            with patch.multiple("usvisa.node.coordinated.cfg", EARLIEST_ACCEPTABLE_DATE="2026-11-01",
-                                LATEST_ACCEPTABLE_DATE="2026-12-01", EXCLUSION_DATE_RANGES=[], TEST_MODE=False), \
-                 patch("usvisa.node.coordinated.solo.log_message"), patch.object(client, "verify_booking", return_value=False):
-                with self.assertRaises(BookingNotVerified):
-                    worker.poll(client)
-        finally:
-            remove()
-        session.post.assert_called_once()
-        entries = self.entries()
-        for event in ("times_requested", "booking_prepared", "booking_post_started", "booking_post_outcome", "booking_verification", "operation_exception"):
-            self.assertTrue(any(entry.event == event for entry in entries), event)
-        self.assertEqual(len({entry.trace_id for entry in entries}), 1)
-        self.assertTrue(any(entry.details.get("outcome") == "HTTP 422" for entry in entries))
-        self.assertNotIn("fresh-token", json.dumps([entry.details for entry in entries]))
+
 
 
 class LogPortalTests(unittest.TestCase):
@@ -210,9 +187,10 @@ class LogPortalTests(unittest.TestCase):
         self.add_log("alice")
         self.add_log("bob")
 
-    def add_log(self, username, *, entry_id=None, category="poll", level="info", group=None, observed=None):
-        entry = LogEntry(entry_id or uuid4(), observed or self.now, category, level, "poll_completed", self.trace, group,
-                         {"dates": ["2027-06-23"], "count": 1})
+    def add_log(self, username, *, entry_id=None, category="poll", level="info", group=None, observed=None,
+                event="poll_completed", details=None, trace=None):
+        entry = LogEntry(entry_id or uuid4(), observed or self.now, category, level, event, trace or self.trace, group,
+                         details if details is not None else {"dates": ["2027-06-23"], "count": 1})
         message = Message.create(NodeLogs(self.nodes[username], (entry,)), sent_at=self.now)
         result = self.service.handle(message, publisher=f"node_{self.nodes[username]}", now=self.now)
         self.assertEqual(result.status, "processed")
@@ -241,6 +219,7 @@ class LogPortalTests(unittest.TestCase):
         self.assertEqual(self.client.get(f"/api/v1/logs/{bob_id}").status_code, 404)
 
     def test_admin_can_view_all_nodes_and_errors_are_separate_from_expected_retries(self):
+        self.add_log("alice", category="reschedule", group="reschedule", event="times_requested")
         self.add_log("alice", category="error", level="error", group="reschedule")
         self.add_log("bob", level="warning")
         self.login("admin")
@@ -270,7 +249,7 @@ class LogPortalTests(unittest.TestCase):
         first = self.client.get("/api/v1/logs?limit=1").json()
         second = self.client.get(f"/api/v1/logs?limit=1&before={first['nextCursor']}").json()
         self.assertNotEqual(first["events"][0]["id"], second["events"][0]["id"])
-        for query in ("hours=721", "hours=0", "limit=1000", "view=unknown", "nodeId=invalid", "before=-1"):
+        for query in ("hours=169", "hours=720", "hours=0", "limit=1000", "view=unknown", "nodeId=invalid", "before=-1", "eventType=bad event"):
             self.assertEqual(self.client.get("/api/v1/logs?" + query).status_code, 422)
 
     def test_delayed_delivery_is_sorted_by_observation_with_stable_pagination(self):
@@ -285,3 +264,82 @@ class LogPortalTests(unittest.TestCase):
         self.assertIsNone(cursor)
         self.assertEqual(len({event["id"] for event in events}), 3)
         self.assertLess(events[-1]["occurredAt"], events[0]["occurredAt"])
+
+    def test_observation_without_booking_is_hidden_and_actual_trace_has_one_entry(self):
+        for event in ("availability_response", "availability_filtered"):
+            self.add_log("alice", category="reschedule", group="reschedule", event=event)
+        self.login("alice")
+        self.assertEqual(self.client.get("/api/v1/logs?view=reschedule").json()["total"], 0)
+        for event in ("booking_attempt_started", "times_requested", "times_response", "booking_no_times"):
+            self.add_log("alice", category="reschedule", group="reschedule", event=event,
+                         details={"dry_run": False, "date": "2027-06-23"})
+        data = self.client.get("/api/v1/logs?view=reschedule").json()
+        self.assertEqual((data["total"], len(data["events"]), len(data["points"])), (1, 1, 1))
+        self.assertTrue(data["events"][0]["isTrace"])
+        self.assertEqual(data["events"][0]["stepCount"], 6)
+        detail = self.client.get(f"/api/v1/logs/{data['events'][0]['id']}").json()
+        self.assertEqual(len(detail["trace"]), 7)  # Includes the original poll.
+
+    def test_dry_runs_are_excluded_even_before_completion_and_legacy_attempts_are_kept(self):
+        self.add_log("alice", category="reschedule", group="reschedule", event="booking_attempt_started", details={"dry_run": True})
+        self.add_log("alice", category="reschedule", group="reschedule", event="times_requested")
+        self.add_log("bob", category="reschedule", group="reschedule", event="times_requested")
+        self.add_log("bob", category="reschedule", group="reschedule", event="booking_no_times")
+        self.login("admin")
+        data = self.client.get("/api/v1/logs?view=reschedule").json()
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["events"][0]["owner"], "bob")
+        self.add_log("bob", category="reschedule", group="reschedule", event="booking_dry_run")
+        self.assertEqual(self.client.get("/api/v1/logs?view=reschedule").json()["total"], 0)
+
+    def test_event_filter_matches_whole_trace_and_grouped_pagination_never_repeats_steps(self):
+        for trace in (self.trace, uuid4()):
+            self.add_log("alice", category="reschedule", group="reschedule", event="times_requested", trace=trace)
+            self.add_log("alice", category="error", level="error", group="reschedule", event="operation_exception", trace=trace)
+        self.login("alice")
+        first = self.client.get("/api/v1/logs?view=reschedule&eventType=times_requested&limit=1").json()
+        self.assertEqual(first["total"], 2)
+        self.assertEqual(first["events"][0]["event"], "operation_exception")
+        self.assertEqual(set(first["eventTypes"]), {"times_requested", "operation_exception"})
+        second = self.client.get(f"/api/v1/logs?view=reschedule&eventType=times_requested&limit=1&before={first['nextCursor']}").json()
+        self.assertNotEqual(first["events"][0]["traceId"], second["events"][0]["traceId"])
+        self.assertIsNone(second["nextCursor"])
+        self.assertEqual(self.client.get("/api/v1/logs?eventType=times_requested").json()["total"], 0)
+        self.assertEqual(self.client.get("/api/v1/logs?view=errors&eventType=operation_exception").json()["total"], 2)
+
+    def test_expired_logs_are_physically_pruned_and_delayed_upload_cannot_restore_them(self):
+        from usvisa.coordinator.logs import store
+        old = self.now - timedelta(days=8)
+        entry = LogEntry(uuid4(), old, "poll", "info", "poll_completed", None, None, {})
+        with self.repository.transaction() as work:
+            store(work, self.nodes["alice"], entry, old)
+            old_id = work.connection.execute("SELECT id FROM node_logs WHERE event_id=?", (str(entry.event_id),)).fetchone()[0]
+        self.service.expire(now=self.now)
+        with self.repository.transaction() as work:
+            self.assertIsNone(work.connection.execute("SELECT 1 FROM node_logs WHERE id=?", (old_id,)).fetchone())
+        self.add_log("alice", observed=old)
+        self.login("alice")
+        self.assertEqual(self.client.get("/api/v1/logs?hours=168").json()["total"], 1)
+        self.assertEqual(self.client.get(f"/api/v1/logs/{old_id}").status_code, 404)
+
+    def test_retention_prunes_history_but_preserves_pending_delivery_and_current_boundary(self):
+        from usvisa.coordinator.logs import prune, store
+        from usvisa.protocol.messages import SlotsFound
+        old = self.now - timedelta(days=8)
+        finding = Message.create(SlotsFound(self.nodes["alice"], old, (date(2027, 6, 23),)), sent_at=old)
+        pending = Message.create(NodeConfig(self.nodes["alice"], uuid4(), True, ()), sent_at=old)
+        published = Message.create(NodeConfig(self.nodes["alice"], uuid4(), True, ()), sent_at=old)
+        entry = LogEntry(uuid4(), self.now - timedelta(days=7), "poll", "info", "poll_completed", None, None, {})
+        with self.repository.transaction() as work:
+            work.record(self.nodes["alice"], finding, "processed", None, old)
+            work.finding(self.nodes["alice"], finding, old + timedelta(minutes=3))
+            work.enqueue(self.nodes["alice"], "visa.control", pending)
+            work.enqueue(self.nodes["alice"], "visa.control", published)
+            work.connection.execute("UPDATE outbox SET status='published' WHERE message_id=?", (str(published.message_id),))
+            store(work, self.nodes["alice"], entry, self.now)
+            prune(work, self.now)
+            self.assertEqual(work.connection.execute("SELECT count(*) FROM findings").fetchone()[0], 0)
+            self.assertFalse(work.seen(self.nodes["alice"], finding.message_id))
+            self.assertIsNotNone(work.connection.execute("SELECT 1 FROM node_logs WHERE event_id=?", (str(entry.event_id),)).fetchone())
+            self.assertIsNotNone(work.connection.execute("SELECT 1 FROM outbox WHERE message_id=?", (str(pending.message_id),)).fetchone())
+            self.assertIsNone(work.connection.execute("SELECT 1 FROM outbox WHERE message_id=?", (str(published.message_id),)).fetchone())

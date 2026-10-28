@@ -30,6 +30,8 @@ class Coordinator:
         # a fresh group. Unchanged live state keeps the same UUID and revision.
         with repository.transaction() as work:
             work.initialize(config)
+            from .logs import prune
+            prune(work, utc(now))
             self._reconcile(work, utc(now))
 
     def _snapshot(self, work: UnitOfWork, node: NodeRecord, now: datetime,
@@ -47,7 +49,7 @@ class Coordinator:
         active = {node.node_id: node for node in nodes if node.active}
         previous = {node.node_id: node.start_at for node in nodes if node.start_at is not None}
         state = work.schedule()
-        report_before = max((node.min_date for node in active.values()), default=None)
+        report_before = max((node.min_date for node in active.values() if not node.passive and node.min_date), default=None)
         membership_changed = active.keys() != previous.keys()
         changed = membership_changed or state.report_before != report_before or state.config != self.config
         if changed:
@@ -67,6 +69,8 @@ class Coordinator:
 
     def expire(self, *, now: datetime) -> bool:
         with self.repository.transaction() as work:
+            from .logs import prune
+            prune(work, utc(now))
             return self._reconcile(work, utc(now))
 
     def reject_invalid(self, *, publisher: str, message_id: UUID, error, now: datetime):
@@ -143,9 +147,10 @@ class Coordinator:
             self._reconcile(work, now)
             return ProcessingResult("ignored", "OLDER_HEARTBEAT")
         data = message.data
-        work.heartbeat(source.node_id, data.min_date, message.sent_at, min(message.sent_at, now))
+        work.heartbeat(source.node_id, data.min_date, message.sent_at, min(message.sent_at, now),
+                       data.slots_version, data.date_exclusions, data.passive)
         work.log_event("Heartbeat received", nodeId=source.node_id, messageId=message.message_id,
-                       minDate=data.min_date, receivedScheduleVersion=data.schedule_version)
+                       minDate=data.min_date, passive=data.passive, receivedScheduleVersion=data.schedule_version)
         changed = self._reconcile(work, now)
         if data.supports_logging and data.logging_version != self.logging_version:
             work.enqueue(source.node_id, "visa.control", Message.create(
@@ -169,10 +174,11 @@ class Coordinator:
         work.finding(source.node_id, message, expires_at)
         from .logs import store
         store(work, source.node_id, LogEntry(message.message_id, data.observed_at, "finding", "info", "slots_found",
-                                            None, None, {"dates": [day.isoformat() for day in data.dates], "count": len(data.dates)}), now)
+                                            None, None, {"dates": [day.isoformat() for day in data.dates],
+                                                         "count": len(data.dates)}), now)
         recipients = []
         for recipient in work.nodes():
-            if not recipient.active or recipient.node_id == source.node_id:
+            if not recipient.active or recipient.passive or recipient.node_id == source.node_id:
                 continue
             dates = tuple(sorted({day for day in data.dates if day < recipient.min_date}))
             if dates:

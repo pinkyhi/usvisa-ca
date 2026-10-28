@@ -10,6 +10,7 @@ from typing import ClassVar
 from uuid import UUID, uuid4
 
 from usvisa.shared.logdata import safe_details
+from usvisa.shared.bodylogs import BODY_EVENTS, validate_chunk
 
 
 INTERVAL_SECONDS = 180
@@ -19,6 +20,7 @@ HEARTBEAT_TTL_SECONDS = 60
 FINDING_TTL_SECONDS = 180
 CLOCK_SKEW_SECONDS = 5
 MAX_MESSAGE_BYTES = 65_536
+MAX_SLOTS_PER_MESSAGE = 512
 ERROR_CODES = frozenset({
     "INVALID_MESSAGE", "UNSUPPORTED_VERSION", "NODE_ID_MISMATCH", "NODE_REVOKED",
     "INVALID_MIN_DATE", "INVALID_SCHEDULE_VERSION", "INVALID_OBSERVED_AT",
@@ -63,10 +65,13 @@ class GroupConfig:
 class Heartbeat:
     TYPE: ClassVar[str] = "node.heartbeat"
     node_id: UUID
-    min_date: date
+    min_date: date | None
     schedule_version: UUID | None
     logging_version: UUID | None = None
     supports_logging: bool = False
+    slots_version: int = 0
+    date_exclusions: bool = False
+    passive: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,8 +110,17 @@ class ScheduleUpdated:
     revision: int
     start_at: datetime
     interval_seconds: int
-    report_before: date
+    report_before: date | None
     config: GroupConfig
+
+
+@dataclass(frozen=True, order=True)
+class AppointmentSlot:
+    date: date
+    time: str
+
+    def to_dict(self):
+        return {"date": self.date.isoformat(), "time": self.time}
 
 
 @dataclass(frozen=True)
@@ -114,7 +128,13 @@ class SlotsFound:
     TYPE: ClassVar[str] = "slots.found"
     node_id: UUID
     observed_at: datetime
-    dates: tuple[date, ...]
+    dates: tuple[date, ...] = ()
+    slots: tuple[AppointmentSlot, ...] = ()
+    excluded_slots: tuple[AppointmentSlot, ...] = ()
+
+    def __post_init__(self):
+        if self.slots:
+            object.__setattr__(self, "dates", tuple(sorted({slot.date for slot in self.slots})))
 
 
 @dataclass(frozen=True)
@@ -124,7 +144,13 @@ class SlotsAvailable:
     source_node_id: UUID
     observed_at: datetime
     expires_at: datetime
-    dates: tuple[date, ...]
+    dates: tuple[date, ...] = ()
+    slots: tuple[AppointmentSlot, ...] = ()
+    excluded_slots: tuple[AppointmentSlot, ...] = ()
+
+    def __post_init__(self):
+        if self.slots:
+            object.__setattr__(self, "dates", tuple(sorted({slot.date for slot in self.slots})))
 
 
 @dataclass(frozen=True)
@@ -139,10 +165,18 @@ Payload = Heartbeat | NodeConfig | NodeLogs | ScheduleUpdated | SlotsFound | Slo
 
 def _payload_dict(data: Payload) -> dict:
     if isinstance(data, Heartbeat):
-        result = {"nodeId": str(data.node_id), "minDate": data.min_date.isoformat(),
+        result = {"nodeId": str(data.node_id),
                   "scheduleVersion": str(data.schedule_version) if data.schedule_version else None}
+        if data.passive:
+            result["passive"] = True
+        else:
+            result["minDate"] = data.min_date.isoformat() if data.min_date else None
         if data.supports_logging:
             result["loggingVersion"] = str(data.logging_version) if data.logging_version else None
+        if data.slots_version:
+            result["slotsVersion"] = data.slots_version
+        if data.date_exclusions:
+            result["dateExclusions"] = True
         return result
     if isinstance(data, NodeConfig):
         return {"nodeId": str(data.node_id), "configVersion": str(data.config_version),
@@ -156,15 +190,19 @@ def _payload_dict(data: Payload) -> dict:
     if isinstance(data, ScheduleUpdated):
         return {"nodeId": str(data.node_id), "scheduleVersion": str(data.schedule_version),
                 "revision": data.revision, "startAt": timestamp(data.start_at),
-                "intervalSeconds": data.interval_seconds, "reportBefore": data.report_before.isoformat(),
+                "intervalSeconds": data.interval_seconds, "reportBefore": data.report_before.isoformat() if data.report_before else None,
                 "config": data.config.to_dict()}
     if isinstance(data, SlotsFound):
         return {"nodeId": str(data.node_id), "observedAt": timestamp(data.observed_at),
-                "dates": [day.isoformat() for day in data.dates]}
+                **({"slots": [slot.to_dict() for slot in data.slots]} if data.slots else
+                   {"dates": [day.isoformat() for day in data.dates]}),
+                **({"excludedSlots": [slot.to_dict() for slot in data.excluded_slots]} if data.excluded_slots else {})}
     if isinstance(data, SlotsAvailable):
         return {"findingId": str(data.finding_id), "sourceNodeId": str(data.source_node_id),
                 "observedAt": timestamp(data.observed_at), "expiresAt": timestamp(data.expires_at),
-                "dates": [day.isoformat() for day in data.dates]}
+                **({"slots": [slot.to_dict() for slot in data.slots]} if data.slots else
+                   {"dates": [day.isoformat() for day in data.dates]}),
+                **({"excludedSlots": [slot.to_dict() for slot in data.excluded_slots]} if data.excluded_slots else {})}
     if isinstance(data, Error):
         return {"code": data.code, "message": data.message}
     raise TypeError("Unsupported payload type")
@@ -246,6 +284,32 @@ def _days(value) -> tuple[date, ...]:
     return tuple(sorted({_day(day) for day in value}))
 
 
+def _slots(value) -> tuple[AppointmentSlot, ...]:
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_SLOTS_PER_MESSAGE:
+        _invalid("slots must contain 1 to 512 date/time pairs")
+    result = []
+    for item in value:
+        item = _fields(item, {"date", "time"})
+        slot_time = item["time"]
+        if (not isinstance(slot_time, str) or not re.fullmatch(r"\d{2}:\d{2}", slot_time)
+                or int(slot_time[:2]) > 23 or int(slot_time[3:]) > 59):
+            _invalid("Expected local consulate time in HH:MM format")
+        result.append(AppointmentSlot(_day(item["date"]), slot_time))
+    return tuple(sorted(set(result)))
+
+
+def _finding_fields(data, required):
+    data = _fields(data, required, {"dates", "slots", "excludedSlots"})
+    if ("dates" in data) == ("slots" in data):
+        _invalid("Expected exactly one of dates or slots")
+    slots = _slots(data["slots"]) if "slots" in data else ()
+    dates = tuple(sorted({slot.date for slot in slots})) if slots else _days(data["dates"])
+    excluded = _slots(data["excludedSlots"]) if "excludedSlots" in data else ()
+    if excluded and (slots or any(slot.date not in dates for slot in excluded)):
+        _invalid("Exclusions must refer to dates in a date finding")
+    return data, dates, slots, excluded
+
+
 def _unique_object(pairs):
     result = {}
     for key, value in pairs:
@@ -284,12 +348,20 @@ def parse_message(body: str | bytes) -> Message:
     data = value["data"]
     kind = value["type"]
     if kind == Heartbeat.TYPE:
-        data = _fields(data, {"nodeId", "minDate", "scheduleVersion"}, {"loggingVersion"})
-        payload = Heartbeat(_uuid(data["nodeId"]), _day(data["minDate"], "INVALID_MIN_DATE"),
+        data = _fields(data, {"nodeId", "scheduleVersion"}, {"minDate", "passive", "loggingVersion", "slotsVersion", "dateExclusions"})
+        passive = data.get("passive", False)
+        if type(passive) is not bool or (passive and "minDate" in data):
+            _invalid("Passive heartbeat must omit minDate")
+        minimum = None if passive else _day(data.get("minDate"), "INVALID_MIN_DATE")
+        if "slotsVersion" in data and (type(data["slotsVersion"]) is not int or data["slotsVersion"] != 1):
+            _invalid("Unsupported prepared slots capability")
+        if "dateExclusions" in data and type(data["dateExclusions"]) is not bool:
+            _invalid("dateExclusions must be a boolean")
+        payload = Heartbeat(_uuid(data["nodeId"]), minimum,
                             _uuid(data["scheduleVersion"], "INVALID_SCHEDULE_VERSION")
                             if data["scheduleVersion"] is not None else None,
                             _uuid(data["loggingVersion"]) if data.get("loggingVersion") is not None else None,
-                            "loggingVersion" in data)
+                            "loggingVersion" in data, data.get("slotsVersion", 0), data.get("dateExclusions", False), passive)
     elif kind == NodeConfig.TYPE:
         data = _fields(data, {"nodeId", "configVersion", "verbose", "logGroups"})
         if type(data["verbose"]) is not bool or type(data["logGroups"]) is not list:
@@ -309,9 +381,18 @@ def parse_message(body: str | bytes) -> Message:
                     or not isinstance(item["event"], str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,79}", item["event"])
                     or item["logGroup"] not in (None, "reschedule") or type(item["details"]) is not dict):
                 _invalid("Invalid log entry")
+            if item["event"] in BODY_EVENTS:
+                if item["category"] != "reschedule" or item["logGroup"] != "reschedule":
+                    _invalid("Invalid diagnostic body category")
+                try:
+                    details = validate_chunk(item["details"])
+                except ValueError:
+                    _invalid("Invalid diagnostic body chunk")
+            else:
+                details = safe_details(item["details"])
             entries.append(LogEntry(_uuid(item["eventId"]), _moment(item["occurredAt"]), item["category"],
                                     item["level"], item["event"], _uuid(item["traceId"]) if item["traceId"] is not None else None,
-                                    item["logGroup"], safe_details(item["details"])))
+                                    item["logGroup"], details))
         payload = NodeLogs(_uuid(data["nodeId"]), tuple(entries))
     elif kind == ScheduleUpdated.TYPE:
         data = _fields(data, {"nodeId", "scheduleVersion", "revision", "startAt",
@@ -328,13 +409,13 @@ def parse_message(body: str | bytes) -> Message:
         payload = ScheduleUpdated(_uuid(data["nodeId"]),
                                   _uuid(data["scheduleVersion"], "INVALID_SCHEDULE_VERSION"),
                                   data["revision"], _moment(data["startAt"]),
-                                  data["intervalSeconds"], _day(data["reportBefore"]), group)
+                                  data["intervalSeconds"], _day(data["reportBefore"]) if data["reportBefore"] is not None else None, group)
     elif kind == SlotsFound.TYPE:
-        data = _fields(data, {"nodeId", "observedAt", "dates"})
+        data, dates, slots, excluded = _finding_fields(data, {"nodeId", "observedAt"})
         payload = SlotsFound(_uuid(data["nodeId"]),
-                             _moment(data["observedAt"], "INVALID_OBSERVED_AT"), _days(data["dates"]))
+                             _moment(data["observedAt"], "INVALID_OBSERVED_AT"), dates, slots, excluded)
     elif kind == SlotsAvailable.TYPE:
-        data = _fields(data, {"findingId", "sourceNodeId", "observedAt", "expiresAt", "dates"})
+        data, dates, slots, excluded = _finding_fields(data, {"findingId", "sourceNodeId", "observedAt", "expiresAt"})
         observed = _moment(data["observedAt"], "INVALID_OBSERVED_AT")
         expires = _moment(data["expiresAt"], "INVALID_OBSERVED_AT")
         try:
@@ -344,7 +425,7 @@ def parse_message(body: str | bytes) -> Message:
         if expires != expected_expiry:
             _invalid("Finding expiry must be observedAt plus 180 seconds", "INVALID_OBSERVED_AT")
         payload = SlotsAvailable(_uuid(data["findingId"]), _uuid(data["sourceNodeId"]),
-                                 observed, expires, _days(data["dates"]))
+                                 observed, expires, dates, slots, excluded)
     elif kind == Error.TYPE:
         data = _fields(data, {"code", "message"})
         if not isinstance(data["code"], str) or data["code"] not in ERROR_CODES:

@@ -14,6 +14,8 @@ class NodeState:
         self.node_id, self.config = node_id, config
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.outbox_ready = threading.Event()
+        self.work_available = threading.Event()
         self.connection = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=10)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode=WAL")
@@ -91,12 +93,14 @@ class NodeState:
             elif not isinstance(data, Error):
                 raise ProtocolError("INVALID_MESSAGE", "Unexpected server command")
             db.execute("INSERT INTO inbox VALUES(?)", (str(message.message_id),))
+        self.work_available.set()
         return "accepted"
 
     def add_finding(self, message, expires_at):
         with self.transaction() as db:
             db.execute("INSERT OR IGNORE INTO outbox VALUES(?, ?, ?)",
                        (str(message.message_id), message.to_json(), expires_at.timestamp()))
+        self.outbox_ready.set()
 
     def pending(self, now):
         with self.transaction() as db:
@@ -110,9 +114,14 @@ class NodeState:
             db.execute("DELETE FROM telemetry_outbox WHERE id=?", (str(message_id),))
 
     def add_telemetry(self, message, expires_at):
+        self.add_telemetry_batch((message,), expires_at)
+
+    def add_telemetry_batch(self, messages, expires_at):
+        # Persist all parts together: a crash cannot leave a partial body queued.
         with self.transaction() as db:
-            db.execute("INSERT OR IGNORE INTO telemetry_outbox VALUES(?,?,?)",
-                       (str(message.message_id), message.to_json(), expires_at.timestamp()))
+            db.executemany("INSERT OR IGNORE INTO telemetry_outbox VALUES(?,?,?)",
+                           [(str(message.message_id), message.to_json(), expires_at.timestamp()) for message in messages])
+        self.outbox_ready.set()
 
     def pending_telemetry(self, now):
         with self.transaction() as db:

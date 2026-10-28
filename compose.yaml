@@ -23,11 +23,11 @@ services:
     shm_size: 512mb
     init: true
     # Solo success or terminal ambiguity must stay stopped.
-    # Coordinated success disables booking and keeps monitoring in this process.
+    # Coordinated success or ambiguity disables booking and keeps monitoring.
     restart: "no"
     stop_grace_period: 30s
   rabbitmq:
-    profiles: [coordinated]
+    profiles: [coordinated, coordinated-passive]
     build: ./infra/rabbitmq
     env_file:
       - path: ${SERVER_ENV_FILE:-.server.env}
@@ -41,7 +41,7 @@ services:
       retries: 12
     restart: unless-stopped
   coordinator:
-    profiles: [coordinated]
+    profiles: [coordinated, coordinated-passive]
     build:
       context: .
       dockerfile: infra/Dockerfile
@@ -63,7 +63,7 @@ services:
       timeout: 5s
       retries: 20
   edge:
-    profiles: [coordinated]
+    profiles: [coordinated, coordinated-passive]
     image: nginx:1.28-alpine
     volumes:
       - ./infra/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -79,13 +79,13 @@ services:
       retries: 15
   quick:
     image: cloudflare/cloudflared:latest
-    profiles: [coordinated-cloudflare_quick]
+    profiles: [coordinated-cloudflare_quick, coordinated-passive-cloudflare_quick]
     command: tunnel --no-autoupdate --metrics 0.0.0.0:20241 --url http://edge:8080
     depends_on: [edge]
     restart: unless-stopped
   tunnel:
     image: cloudflare/cloudflared:latest
-    profiles: [coordinated-cloudflare_domain]
+    profiles: [coordinated-cloudflare_domain, coordinated-passive-cloudflare_domain]
     command: tunnel --no-autoupdate run
     env_file:
       - path: ${SERVER_ENV_FILE:-.server.env}

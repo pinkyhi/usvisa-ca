@@ -1,5 +1,6 @@
 """One independent communication thread: WSS, heartbeat, receipts and manual ACK."""
 import logging
+from collections import deque
 import random
 import re
 import ssl
@@ -30,11 +31,13 @@ def parse_token(token):
 
 
 class WebStomp:
-    def __init__(self, origin, token, min_date, state, *, allow_local=False, origin_provider=None):
+    def __init__(self, origin, token, min_date, state, *, allow_local=False, origin_provider=None, passive_provider=None):
         self.origin = server_origin(origin, allow_local=allow_local)
         self.origin_provider, self.allow_local = origin_provider, allow_local
         self.node_id, self.secret = parse_token(token)
         self.min_date, self.state = min_date, state
+        self.passive_provider = passive_provider or (lambda: False)
+        self.heartbeat_ready = threading.Event()
         self.stopping = threading.Event()
         self.connected = threading.Event()
         self.fatal = None
@@ -43,8 +46,22 @@ class WebStomp:
     def start(self):
         self.thread.start()
 
+    def refresh_heartbeat(self):
+        self.heartbeat_ready.set()
+
+    def heartbeat(self):
+        saved = self.state.snapshot()
+        policy = self.state.logging_config()
+        passive = bool(self.passive_provider())
+        return Message.create(Heartbeat(self.node_id, None if passive else self.min_date,
+                                       saved.data.schedule_version if saved else None,
+                                       policy.config_version if policy else None, True, passive=passive),
+                              sent_at=datetime.now(timezone.utc))
+
     def stop(self):
         self.stopping.set()
+        self.state.outbox_ready.set()
+        self.state.work_available.set()
         if self.thread.ident is not None:
             self.thread.join(timeout=3)
 
@@ -69,7 +86,7 @@ class WebStomp:
         if self.origin_provider:
             self.origin = server_origin(self.origin_provider(), allow_local=self.allow_local)
         # Explicit verification; there is no insecure TLS switch.
-        socket = websocket.WebSocket(sslopt={"cert_reqs": ssl.CERT_REQUIRED, "check_hostname": True})
+        socket = websocket.WebSocket(enable_multithread=True, sslopt={"cert_reqs": ssl.CERT_REQUIRED, "check_hostname": True})
         try:
             socket.connect(websocket_url(self.origin), timeout=1, redirect_limit=0,
                            subprotocols=["v12.stomp"], origin=self.origin)
@@ -83,6 +100,46 @@ class WebStomp:
     def exchange(self, socket):
         decoder = Decoder()
         pending = {}
+        pending_lock = threading.Lock()
+        recent_receipts = deque(maxlen=512)
+        session_done = threading.Event()
+        publisher_errors = []
+        publisher = None
+        wire_activity = [time.monotonic()]
+
+        def publish_outbox():
+            while not session_done.is_set() and not self.stopping.is_set():
+                self.state.outbox_ready.clear()
+                try:
+                    tick_now = datetime.now(timezone.utc)
+                    for message, expiry in [*self.state.pending(tick_now), *self.state.pending_telemetry(tick_now)]:
+                        if session_done.is_set() or self.stopping.is_set():
+                            return
+                        receipt = str(message.message_id)
+                        remaining = max(0, int((expiry - time.time()) * 1000))
+                        if not remaining:
+                            continue
+                        with pending_lock:
+                            if receipt in recent_receipts:
+                                # A stale DB snapshot can race a receipt. An
+                                # explicitly re-enqueued immutable message ID
+                                # is also already durably confirmed here.
+                                self.state.confirmed(message.message_id)
+                                continue
+                            if receipt in pending:
+                                continue
+                            pending[receipt] = time.monotonic()
+                        headers = self.headers(message, remaining)
+                        headers.update({"receipt": receipt, "persistent": "true"})
+                        socket.send(encode("SEND", headers, message.to_json()))
+                        wire_activity[0] = time.monotonic()
+                except Exception as error:
+                    publisher_errors.append(error)
+                    session_done.set()
+                    socket.shutdown()
+                    return
+                self.state.outbox_ready.wait(.5)
+
         sent_hb = sent_wire = last_rx = connected_at = time.monotonic()
         handshake = False
         subscribed = False
@@ -93,35 +150,23 @@ class WebStomp:
         try:
             while not self.stopping.is_set():
                 tick = time.monotonic()
+                if publisher_errors:
+                    raise publisher_errors[0]
                 if tick - last_rx > receive_timeout:
                     raise TimeoutError("STOMP peer stopped sending heartbeats")
                 if not handshake and tick - connected_at > 10:
                     raise TimeoutError("STOMP handshake timed out")
                 if subscribed:
-                    if tick - sent_hb >= 30:
-                        saved = self.state.snapshot()
-                        policy = self.state.logging_config()
-                        hb = Message.create(Heartbeat(self.node_id, self.min_date,
-                                                     saved.data.schedule_version if saved else None,
-                                                     policy.config_version if policy else None, True),
-                                            sent_at=datetime.now(timezone.utc))
+                    if tick - sent_hb >= 30 or self.heartbeat_ready.is_set():
+                        self.heartbeat_ready.clear()
+                        hb = self.heartbeat()
                         socket.send(encode("SEND", self.headers(hb, 60_000), hb.to_json()))
                         sent_hb = sent_wire = tick
-                    tick_now = datetime.now(timezone.utc)
-                    for message, expiry in [*self.state.pending(tick_now), *self.state.pending_telemetry(tick_now)]:
-                        receipt = str(message.message_id)
-                        if receipt in pending:
-                            continue
-                        remaining = max(0, int((expiry - time.time()) * 1000))
-                        if remaining:
-                            headers = self.headers(message, remaining)
-                            headers.update({"receipt": receipt, "persistent": "true"})
-                            socket.send(encode("SEND", headers, message.to_json()))
-                            pending[receipt] = tick
-                            sent_wire = tick
-                    if any(tick - at > 20 for at in pending.values()):
+                    with pending_lock:
+                        timed_out = any(tick - at > 20 for at in pending.values())
+                    if timed_out:
                         raise TimeoutError("Broker receipt timed out")
-                if handshake and tick - sent_wire >= 10:
+                if handshake and tick - max(sent_wire, wire_activity[0]) >= 10:
                     socket.send("\n")
                     socket.ping()
                     sent_wire = tick
@@ -145,14 +190,20 @@ class WebStomp:
                         sent_wire = tick
                     elif frame.command == "RECEIPT":
                         receipt = frame.headers.get("receipt-id")
-                        if receipt == "subscribed":
+                        if receipt == "subscribed" and publisher is None:
                             subscribed = True
                             self.connected.set()
                             log.info("Coordinator connected; personal inbox subscribed, heartbeat every 30s")
                             sent_hb = -1e9
-                        elif receipt in pending:
-                            self.state.confirmed(UUID(receipt))
-                            del pending[receipt]
+                            publisher = threading.Thread(target=publish_outbox, name="coordinator-publisher", daemon=True)
+                            publisher.start()
+                        else:
+                            with pending_lock:
+                                if receipt in pending:
+                                    self.state.confirmed(UUID(receipt))
+                                    recent_receipts.append(receipt)
+                                    del pending[receipt]
+                                    self.state.outbox_ready.set()
                     elif frame.command == "MESSAGE":
                         try:
                             message = parse_message(frame.body)
@@ -181,6 +232,10 @@ class WebStomp:
                         # Rabbit errors can contain original CONNECT headers; never echo them.
                         raise ConnectionError("Broker rejected the STOMP operation")
         finally:
+            session_done.set()
+            self.state.outbox_ready.set()
+            if publisher:
+                publisher.join(timeout=2)
             self.connected.clear()
 
     def headers(self, message, expiration):

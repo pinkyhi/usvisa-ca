@@ -301,13 +301,14 @@ def create_app(config, *, repository=None, admin=None, run_broker=True):
                 "canViewAllLogs": user["username"] in config.admin_users}
 
     @app.get("/api/v1/logs")
-    async def node_logs(request: Request, hours: int = Query(24, ge=1, le=720),
+    async def node_logs(request: Request, hours: int = Query(24, ge=1, le=168),
                         nodeId: UUID | None = None, view: str = Query("activity", pattern="^(activity|errors|reschedule)$"),
-                        before: int | None = Query(None, ge=1), limit: int = Query(100, ge=1, le=200)):
+                          before: int | None = Query(None, ge=1), limit: int = Query(100, ge=1, le=200),
+                          eventType: str | None = Query(None, pattern="^[a-z][a-z0-9_]{0,79}$")):
         from .logs import browse
         user = current(request)
         return browse(repository, owner_id=None if user["username"] in config.admin_users else user["user_id"],
-                      hours=hours, node_id=nodeId, view=view, before=before, limit=limit)
+                        hours=hours, node_id=nodeId, view=view, before=before, limit=limit, event_type=eventType)
 
     @app.get("/api/v1/logs/{event_id}")
     async def log_detail(request: Request, event_id: int):

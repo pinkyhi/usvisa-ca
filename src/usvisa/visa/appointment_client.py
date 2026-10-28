@@ -1,6 +1,7 @@
 """HTTP availability and booking using a session authenticated by Selenium."""
 
 import random
+import copy
 import re
 import time as clock
 from usvisa.shared import audit
@@ -8,9 +9,11 @@ from dataclasses import dataclass
 from datetime import date, time, datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlsplit
+from uuid import uuid4
 
 import requests
 from bs4 import BeautifulSoup
+
 
 
 class PortalError(RuntimeError):
@@ -41,12 +44,22 @@ class RateLimited(PortalError):
 class BookingNotVerified(PortalError):
     """A POST may have changed the appointment; do not automatically resubmit."""
 
+    def __init__(self, message, *, day=None, slot_time=None, post_sent=None):
+        super().__init__(message)
+        self.day, self.slot_time, self.post_sent = day, slot_time, post_sent
+
 
 @dataclass(frozen=True)
 class BookingResult:
     date: date
     time: str
     dry_run: bool
+
+
+@dataclass(frozen=True)
+class BookingPending:
+    date: date
+    time: str
 
 
 def acceptable_dates(dates, earliest, latest, exclusions):
@@ -90,8 +103,8 @@ def replace_fields(fields, values):
     return [(name, value) for name, value in fields if name not in values] + list(values.items())
 
 
-def appointment_matches(text, wanted_date, wanted_time):
-    """Match only a labelled saved appointment, never a booking form value."""
+def appointment_values(text):
+    """Extract date/time values from a labelled saved appointment."""
     text = " ".join(text.split())
     dates = set()
     for value in re.findall(r"\b\d{4}-\d{2}-\d{2}\b", text):
@@ -125,6 +138,11 @@ def appointment_matches(text, wanted_date, wanted_time):
             times.add(time(hour, minute).strftime("%H:%M"))
         except ValueError:
             pass
+    return dates, times
+
+
+def appointment_matches(text, wanted_date, wanted_time):
+    dates, times = appointment_values(text)
     return dates == {wanted_date} and times == {wanted_time}
 
 
@@ -140,6 +158,7 @@ class AppointmentClient:
         self.appointment_params = {}
         self.schedule_id = None
         self._prepared_form = None
+        self.current_appointment = None
         if appointment_url is not None:
             self._set_appointment_url(appointment_url)
 
@@ -445,30 +464,79 @@ class AppointmentClient:
         return False
 
     def verify_booking(self, day, slot_time):
-        for url, account_page in (
-            (self.appointment_url + "/instructions", False),
-            (self.account_url, True),
-        ):
-            try:
-                response = self._get(url, headers={"Cache-Control": "no-cache"})
-            except RateLimited:
-                # A POST may already have succeeded. Stop for manual verification
-                # rather than issue another GET or retry the booking.
-                return False
-            except PortalError:
-                continue
-            if not account_page and urlsplit(response.url).path.rstrip("/") != urlsplit(url).path:
-                account_page = True
-            matches = self._saved_appointment_matches(response.text, day, slot_time, account_page)
-            audit.event("verification_page", source="account" if account_page else "instructions", matches=matches)
-            if matches:
-                return True
-        return False
+        response = self._get(self.account_url, headers={"Cache-Control": "no-cache"})
+        matches = self._saved_appointment_matches(response.text, day, slot_time, account_page=True)
+        audit.event("verification_page", source="account", matches=matches)
+        return matches
+
+    def verification_client(self):
+        """Independent session for read-only verification alongside availability."""
+        session = requests.Session()
+        try:
+            session.headers.update(self.session.headers)
+            session.cookies = copy.deepcopy(self.session.cookies)
+            session.verify = self.session.verify
+            session.cert = self.session.cert
+            session.proxies = self.session.proxies.copy()
+            session.trust_env = self.session.trust_env
+            return AppointmentClient(session, self.appointment_url, self.facility_id, self.consulate, self.timeout)
+        except BaseException:
+            session.close()
+            raise
+
+    def capture_current_appointment(self):
+        """Read the saved appointment from its application on the account page."""
+        response = self._get(self.account_url, headers={"Cache-Control": "no-cache"})
+        current = self._current_appointment_from_response(response)
+        self.current_appointment = current
+        if current:
+            audit.event("current_appointment", source="account", **current)
+        else:
+            audit.event("current_appointment", status="unavailable", level="warning")
+        return current
+
+    def _current_appointment_from_response(self, response):
+        soup = BeautifulSoup(response.text, "html.parser")
+        for element in soup.find_all(["form", "script", "style"]):
+            element.decompose()
+        application = None
+        for link in soup.find_all("a", href=True):
+            if re.search(rf"/schedule/{self.schedule_id}(?:/|$)", urlsplit(link["href"]).path):
+                application = link.find_parent(class_="application")
+                if application is not None:
+                    break
+        if application is None:
+            return None
+        soup = application
+        summaries = [part.get_text(" ", strip=True) for part in soup.select(".consular-appt")]
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td", "th"], recursive=False)
+            if len(cells) >= 2 and re.search(r"Consular\s+(?:Section\s+Interview\s+Date|Appointment)",
+                                           cells[0].get_text(" ", strip=True), re.I):
+                summaries.append(" ".join(cell.get_text(" ", strip=True) for cell in cells[1:]))
+        for label in soup.find_all(["strong", "b", "dt"]):
+            if re.fullmatch(r"Consular\s+(?:Section\s+Interview\s+Date|Appointment):?", label.get_text(" ", strip=True), re.I):
+                value = label.find_next_sibling("dd") if label.name == "dt" else label.parent
+                if value is not None:
+                    summaries.append(value.get_text(" ", strip=True))
+        for text in summaries:
+            dates, times = appointment_values(text)
+            if len(dates) == len(times) == 1:
+                day, slot_time = next(iter(dates)), next(iter(times))
+                if self._saved_appointment_matches(str(soup), day, slot_time):
+                    return {"date": day.isoformat(), "time": slot_time, "consulate": self.consulate}
+        return None
 
     def book(self, day, dry_run=True, *, expires_at=None):
+        if not dry_run and audit.read_claim(self.schedule_id) is not None:
+            guard = audit.read_claim(self.schedule_id)
+            audit.event("booking_blocked", reason="saved_booking_state")
+            raise BookingNotVerified("Saved booking state blocks another POST; monitoring can continue.",
+                                     day=guard.get("date"), slot_time=guard.get("time"))
         if expires_at is not None and datetime.now(timezone.utc) >= expires_at:
             audit.event("shared_slot_expired", date=day)
             return None
+        audit.event("booking_attempt_started", date=day, dry_run=dry_run)
         # Startup already validated the form and CSRF in this HTTP session.
         # Direct callers without that preparation still need one form GET.
         form_cached = self._prepared_form is not None
@@ -485,57 +553,48 @@ class AppointmentClient:
             return None
         slot_time = random.choice(times)
         prefix = "appointments[consulate_appointment]"
-        values = {
-            f"{prefix}[facility_id]": str(self.facility_id),
-            f"{prefix}[date]": day.isoformat(),
-            f"{prefix}[time]": slot_time,
-        }
+        values = {f"{prefix}[facility_id]": str(self.facility_id),
+                  f"{prefix}[date]": day.isoformat(), f"{prefix}[time]": slot_time}
         if any(name == "confirmed_limit_message" for name, _ in fields):
             values["confirmed_limit_message"] = "1"
         fields = replace_fields(fields, values)
-        result = BookingResult(day, slot_time, dry_run)
         audit.event("booking_prepared", date=day, time=slot_time, consulate=self.consulate,
                     dry_run=dry_run, prepared_form_cached=form_cached,
                     applicant_count=sum(name == "appointments[applicant_ids][]" for name, _ in fields))
         if dry_run:
             audit.event("booking_dry_run", booking_post_sent=False)
-            return result
+            return BookingResult(day, slot_time, True)
         try:
-            audit.claim(self.schedule_id, day, slot_time, self.consulate)
+            record = audit.event("booking_submission_pending", date=day, time=slot_time)
+            audit.claim(self.schedule_id, day, slot_time, self.consulate,
+                        attempt_id=uuid4().hex, trace_id=record.get("trace_id") if record else None)
+            claimed = audit.read_claim(self.schedule_id)
         except FileExistsError as error:
-            audit.event("booking_blocked", reason="persistent_submission_guard")
-            raise BookingNotVerified("A booking submission was already reserved for this application. Check the portal and .booking-state before any further booking; no POST was sent.") from error
+            guard = audit.read_claim(self.schedule_id) or {}
+            raise BookingNotVerified("A submission was already reserved; no POST was sent.",
+                                     day=guard.get("date") or day, slot_time=guard.get("time") or slot_time) from error
         except OSError as error:
-            raise BookingNotVerified("Could not persist booking guard; no POST was sent.") from error
+            raise PortalError("Could not persist booking state; no POST was sent.") from error
+        if not claimed:
+            raise PortalError("Booking state disappeared; no POST was sent.")
         audit.event("booking_post_started", date=day, time=slot_time, consulate=self.consulate)
+        audit.http_body("booking_http_request",
+                        lambda: requests.Request("POST", self.appointment_url, data=fields).prepare().body,
+                        method="POST", date=day, time=slot_time)
         started = clock.monotonic()
         origin = urlsplit(self.appointment_url)
         try:
-            response = self.session.post(
-                self.appointment_url, data=fields, timeout=self.timeout,
-                # A 307/308 redirect would replay this POST inside requests.
-                # Verify the saved appointment with explicit GETs below instead.
-                allow_redirects=False,
-                headers={"Referer": self.appointment_url,
-                         "Origin": f"{origin.scheme}://{origin.netloc}",
-                         "X-CSRF-Token": csrf},
-            )
+            response = self.session.post(self.appointment_url, data=fields, timeout=self.timeout,
+                allow_redirects=False, headers={"Referer": self.appointment_url,
+                "Origin": f"{origin.scheme}://{origin.netloc}", "X-CSRF-Token": csrf})
             outcome = f"HTTP {response.status_code}"
+            audit.http_body("booking_http_response", lambda: response.text,
+                            method="POST", date=day, time=slot_time, status=response.status_code)
+            level = "warning" if response.status_code == 429 else "error" if response.status_code >= 400 else "info"
         except requests.RequestException as error:
-            # A timeout does not prove the server failed to save the booking.
-            outcome = type(error).__name__
-        audit.event("booking_post_outcome", outcome=outcome, elapsed_ms=round((clock.monotonic()-started)*1000))
-        try:
-            verified = self.verify_booking(day, slot_time)
-        except Exception as error:
-            audit.event("booking_verification", verified=False, date=day, time=slot_time,
-                        consulate=self.consulate, error_type=type(error).__name__)
-            raise BookingNotVerified("Booking verification failed after submission; guard retained. Check the portal manually.") from error
-        audit.event("booking_verification", verified=verified, date=day, time=slot_time, consulate=self.consulate)
-        if verified:
-            return result
-        raise BookingNotVerified(
-            f"Booking POST completed with {outcome}, but {day} at {slot_time} "
-            f"in {self.consulate} could not be verified. Check the appointment "
-            "in your account before restarting; no automatic booking retry was made."
-        )
+            outcome, level = type(error).__name__, "error"
+        # The response is diagnostic only. Never confirm, retry, or clear the block.
+        audit.event("booking_post_outcome", outcome=outcome, level=level,
+                    elapsed_ms=round((clock.monotonic() - started) * 1000))
+        audit.update_claim(self.schedule_id, expected_claim=claimed, outcome=outcome)
+        return BookingPending(day, slot_time)

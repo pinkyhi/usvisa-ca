@@ -87,7 +87,7 @@ discovers the application, follows setup links and completes consent screens,
 prepares reusable booking fields and CSRF in memory, checks availability, submits the booking and verifies
 the saved date, time and consulate. Once a date is found, the ready session requests its available times and submits without reloading the form. Restored sessions also prepare the form before polling; expired authentication or a changed application discards it. The selected time still comes from the live times endpoint. When multiple times are available, one is selected randomly. The client submits once, waits for the response and verifies the saved appointment; it does not try other times after a POST. `TEST_MODE=true` (default) prepares the form
 without submitting it; set `TEST_MODE=false` in `.env` for real booking.
-An unverified booking stops the script for manual checking.
+An unverified booking stops solo mode for manual checking. Coordinated mode disables further booking and keeps monitoring and sharing.
 
 Configure polling in `.env` (delays are in seconds):
 
@@ -167,7 +167,7 @@ The [setup guide](docs/coordinated-setup.md) covers the working Node/Coordinator
 
 The portal's **Logs** tab shows availability checks on a per-node timeline, serious exceptions, and complete **Reschedule** traces. Set server-side `VERBOSE=true` to collect every poll and `LOG_GROUPS=reschedule` to collect booking diagnostics. Unexpected exceptions are forwarded regardless of those flags; expected HTTP 429 retries are excluded from serious errors. Updated nodes receive the policy automatically through their existing personal queue. See the setup guide for rollout, access and storage details.
 
-Both `solo` and `coordinated` monitoring modes are implemented. Solo remains the default. The compatible `python reschedule.py` launcher remains available, and an editable installation also provides `usvisa-node --mode solo`, `usvisa-node --mode coordinated`, and `python -m usvisa.node`.
+Modes are `solo`, `coordinated`, and `coordinated-passive`. Solo remains the default. Passive nodes share dates on the normal schedule but never request booking times, submit reschedules, or verify pending submissions. The compatible `python reschedule.py` launcher remains available, and an editable installation also provides `usvisa-node --mode solo`, `usvisa-node --mode coordinated`, and `python -m usvisa.node`.
 
 To try the server without your own domain (Docker required):
 
@@ -179,7 +179,21 @@ python scripts/server.py create-user --username admin
 
 Open the displayed HTTPS URL, sign in, create a node, and save its token/configuration. Install `python -m pip install -e ".[node,coordinated]"` on each Node, fill its local visa settings and acceptable date range, set `MODE=coordinated`, `SERVER_URL`, and `NODE_TOKEN`, then launch it. The exclusive notification cutoff defaults to `LATEST_ACCEPTABLE_DATE + 1 day`, so findings on the last acceptable day are included; `NODE_MIN_DATE` is an optional override. Each node polls every 180 seconds with evenly spaced phases (90 seconds apart for two nodes). Heartbeats and delivery run independently of the visa worker. Use `TEST_MODE=true` for the first run.
 
-After a verified real booking, the node prints a green uppercase success message and saves a booking stop in its local SQLite state. Coordinated monitoring, heartbeats and sharing continue, while further booking from either local checks or received findings stays disabled across restarts. The booked date is excluded from future findings. Dry runs do not set this stop and keep polling. Solo mode exits after success; an uncertain booking outcome retains the submission guard and stops for manual verification.
+Booking uses one durable file, `.booking-state/<application_id>.json`, saved as
+`pending` before a real POST. Every result keeps the block: success text, rejection,
+redirect, timeout or exception. No response classification, automatic retry or
+follow-up verification GET is performed. After submission, coordinated nodes keep
+polling and sharing dates as passive observers. Each ordinary poll prints a WARNING
+with the block file's absolute path. Restarting preserves the block; manually
+removing the file or using the reset command permits another attempt.
+
+Passive nodes remain in the polling schedule but send `passive: true` without
+`minDate` in heartbeats. They do not receive findings and do not affect `reportBefore`.
+The same applies automatically while a booking block exists. If every node is
+passive, `reportBefore` is null and there are no finding recipients. Earliest/latest
+acceptable dates and `NODE_MIN_DATE` are optional in explicit passive mode.
+
+`python -m usvisa.node --booking-status` inspects the state without logging in. To allow booking again, stop the node, then run `python -m usvisa.node --reset-booking-block`. This archives its state file under `.booking-state/cleared/` and clears any legacy SQLite flags; the next start may book again. Deleting this application's file after stopping an updated node also resets the block, but the command preserves its history. See the setup guide for Docker commands.
 
 For a combined Docker deployment, save `PORTAL_USERNAME`, `PORTAL_PASSWORD`, and `NODE_NAME` in the private `.env` instead of copying a token. Keep `COMPOSE_PROFILES=${MODE:-solo},${MODE:-solo}-${EXPOSE_MODE:-cloudflare_quick}` alongside `MODE` and `EXPOSE_MODE`. Then `docker compose up -d --build` starts the Coordinator and a Chromium-equipped Node, registers it once, persists its token, receives a schedule, and runs the existing visa worker. `MODE=solo` selects only the Node. Use `python scripts/server.py up --mode solo` or `--mode coordinated` to switch modes and stop unused services automatically. The local Node and Coordinator discover changing Quick Tunnel hostnames without Docker socket access; remote nodes still need their `SERVER_URL` updated. See the setup guide for persistent state and first-account setup.
 
@@ -231,12 +245,19 @@ portal and deliberately deciding to permit another submission.
 `logs/rescheduler.jsonl` contains UTC timestamps, run IDs and process IDs,
 HTTP GET endpoint/status/duration/error type, consent submission events,
 availability and filtering, prepared slot and applicant count, booking POST
-outcome/duration, verification page matches, notifications, and run exit status.
-Cookies, passwords, CSRF tokens, applicant IDs, and portal response bodies are
-not recorded. Audit writes are flushed to disk; a write failure stops execution.
+outcome/duration, notifications, and run exit status. Full POST request/response
+bodies are included only when the reschedule group is enabled.
+When the coordinator enables `LOG_GROUPS=reschedule`, actual booking attempts also
+record the complete URL-encoded POST body and complete response text as
+`booking_http_request` / `booking_http_response` events, locally and in the portal
+trace's **View event data** (`body`). These opt-in bodies include form tokens and
+applicant data without redaction or truncation; headers and cookies are not captured.
+Large bodies travel in persistent parts and reassemble into one event; server
+retention remains seven days. Disabling the group prevents new body capture.
+Ordinary diagnostics remain redacted. Audit writes are flushed to disk.
 The submission marker is kept independently of the audit log.
 
-The flow is: restore session or sign in ? discover application and prepare form
-? retain the prepared form in memory ? fetch and filter dates ? fetch available times ? choose one random
-time ? dry-run exit, or persist guard and submit once ? verify the saved date,
-time and consulate ? notify and exit. Unknown outcomes require manual checking.
+The booking flow is: restore/sign in, prepare the form, poll dates and immediately
+share findings, fetch times once, choose one random time, persist the block and POST.
+The response is logged for analysis only; the block requires a manual reset.
+POST redirects are never followed and no verification GET is scheduled.

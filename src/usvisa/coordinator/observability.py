@@ -10,7 +10,7 @@ _FIELDS = frozenset({
     "nodeId", "nodeName", "username", "messageId", "eventType", "status", "reason",
     "scheduleVersion", "receivedScheduleVersion", "revision", "reportBefore", "minDate",
     "activeNodes", "joined", "removed", "startAt", "intervalSeconds", "city",
-    "dates", "observedAt", "expiresAt", "recipients", "findingId",
+    "dates", "slots", "excludedSlots", "observedAt", "expiresAt", "recipients", "findingId",
     "serverUrl",
 })
 

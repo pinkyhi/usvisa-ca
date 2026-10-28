@@ -2,13 +2,14 @@
 
 from datetime import date, datetime
 import json
+import logging
 from usvisa.shared import audit
 from time import sleep
 
 from selenium.common.exceptions import WebDriverException
 
 from usvisa.visa.appointment_client import (
-    AppointmentClient, AuthenticationExpired, BookingNotVerified, PortalError, RateLimited,
+    AppointmentClient, AuthenticationExpired, BookingNotVerified, BookingPending, PortalError, RateLimited,
     acceptable_dates,
 )
 from usvisa.notifications.email import send_notification
@@ -31,6 +32,14 @@ def log_message(message: str, *, green=False) -> None:
 def log_booking_success(result):
     log_message((f"APPOINTMENT SUCCESSFULLY BOOKED AND VERIFIED: {result.date} AT {result.time} "
                  f"IN {USER_CONSULATE}. AUTOMATIC BOOKING STOPPED.").upper(), green=True)
+
+
+def warn_booking_block(application_id):
+    path = audit.claim_path(application_id).resolve()
+    message = ("Rescheduling was attempted so is blocked now to prevent overbooking. "
+               f"Check this file '{path}' to verify. Remove it to continue reschedule attemps.")
+    audit.event("booking_block_warning", level="warning", message=message)
+    logging.getLogger(__name__).warning(message)
 
 
 def log_available_dates(dates):
@@ -115,6 +124,8 @@ def reschedule(client: AppointmentClient, backoff=None):
     exclusions = [(date.fromisoformat(start), date.fromisoformat(end))
                   for start, end in EXCLUSION_DATE_RANGES]
     while True:
+        if isinstance(getattr(client, "schedule_id", None), (str, int)) and audit.read_claim(client.schedule_id):
+            warn_booking_block(client.schedule_id)
         checks_in_cycle += 1
         try:
             dates = get_available_dates(client)
@@ -133,6 +144,10 @@ def reschedule(client: AppointmentClient, backoff=None):
         audit.event("availability_filtered", available=dates, candidates=candidates, earliest=earliest, latest=latest, exclusions=exclusions)
         if not candidates:
             log_message(f"No dates match the configured range/exclusions; earliest available: {dates[0]}")
+        if isinstance(getattr(client, "schedule_id", None), (str, int)) and audit.read_claim(client.schedule_id):
+            backoff.reset()
+            wait_for_next_check()
+            continue
         rate_limited = False
         for day in candidates:
             log_message(f"Checking appointment times on {day}")
@@ -150,6 +165,9 @@ def reschedule(client: AppointmentClient, backoff=None):
             if result is None:
                 log_message(f"No available times on {day}; checking the next suitable date")
                 continue
+            if isinstance(result, BookingPending):
+                warn_booking_block(client.schedule_id)
+                break
             if result.dry_run:
                 log_message(
                     f"TEST MODE: would book {result.date} at {result.time} in "
